@@ -11,6 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `ox_prune --format json` prints the prune counts as one JSON object,
   for scripts that would otherwise parse the two report lines.
+- `manage.py check` warns with `django_ox.W003` when `BACKOFF_INITIAL` is
+  greater than `BACKOFF_MAX`. Retries still run; every wait is the cap.
 
 ### Fixed
 
