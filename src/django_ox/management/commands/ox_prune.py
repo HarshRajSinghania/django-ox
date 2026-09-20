@@ -1,3 +1,4 @@
+import json
 from typing import Any
 
 from django.core.management.base import CommandError, CommandParser
@@ -13,6 +14,7 @@ from django_ox.models import OxScheduleTick, OxTask
 
 class Command(DatabaseCommand):
     help = "Delete finished task rows older than a cutoff."
+    _partial_task_rows = 0
 
     def add_arguments(self, parser: CommandParser) -> None:
         super().add_arguments(parser)
@@ -51,6 +53,17 @@ class Command(DatabaseCommand):
             "--dry-run",
             action="store_true",
             help="Report how many rows would be deleted without deleting any.",
+        )
+        parser.add_argument(
+            "--format",
+            choices=["text", "json"],
+            default="text",
+            help=(
+                "Output format. json prints one object with the pruning "
+                "figures on stdout, also when a contended batch stops the "
+                "command; the exit status is the same either way "
+                "(default: %(default)s)."
+            ),
         )
 
     def handle(self, *args: Any, **options: Any) -> None:
@@ -94,28 +107,63 @@ class Command(DatabaseCommand):
         ]
         prunable_ticks = ticks.filter(scheduled_for__lt=cutoff).exclude(pk__in=anchors)
 
+        as_json = options["format"] == "json"
+        payload = {
+            "queue": queue,
+            "cutoff": cutoff.isoformat(),
+            "statuses": list(statuses),
+            "dry_run": bool(options["dry_run"]),
+        }
+
         if options["dry_run"]:
+            task_rows = prunable.count()
+            tick_rows = prunable_ticks.count()
+            if as_json:
+                self._write_json(payload, task_rows=task_rows, tick_rows=tick_rows)
+                return
             self.stdout.write(
-                f"Would delete {prunable.count()} {label} task row(s) "
+                f"Would delete {task_rows} {label} task row(s) "
                 f"finished before {cutoff.isoformat()}."
             )
             self.stdout.write(
-                f"Would delete {prunable_ticks.count()} schedule tick row(s) "
+                f"Would delete {tick_rows} schedule tick row(s) "
                 f"scheduled before {cutoff.isoformat()}."
             )
             return
 
-        deleted = self._delete_tasks_in_batches(
-            prunable, options["batch_size"], label, alias
-        )
+        try:
+            deleted = self._delete_tasks_in_batches(
+                prunable, options["batch_size"], label, alias
+            )
+        except CommandError:
+            if as_json:
+                # Batches before the failure have committed; ticks were not
+                # started yet. Report those figures and keep the non-zero exit.
+                self._write_json(
+                    payload,
+                    task_rows=self._partial_task_rows,
+                    tick_rows=0,
+                )
+            raise
+
+        deleted_ticks = self._delete_in_batches(prunable_ticks, options["batch_size"])
+        if as_json:
+            self._write_json(payload, task_rows=deleted, tick_rows=deleted_ticks)
+            return
         self.stdout.write(
             f"Deleted {deleted} {label} task row(s) "
             f"finished before {cutoff.isoformat()}."
         )
-        deleted_ticks = self._delete_in_batches(prunable_ticks, options["batch_size"])
         self.stdout.write(
             f"Deleted {deleted_ticks} schedule tick row(s) "
             f"scheduled before {cutoff.isoformat()}."
+        )
+
+    def _write_json(
+        self, payload: dict[str, Any], *, task_rows: int, tick_rows: int
+    ) -> None:
+        self.stdout.write(
+            json.dumps({**payload, "task_rows": task_rows, "tick_rows": tick_rows})
         )
 
     def _delete_tasks_in_batches(
@@ -128,6 +176,7 @@ class Command(DatabaseCommand):
         # batch, all of it on MySQL. There the error goes to the caller.
         tries = _contention.attempts(alias)
         deleted = 0
+        self._partial_task_rows = 0
         while True:
             candidates = list(prunable.values_list("pk", flat=True)[:batch_size])
             if not candidates:
@@ -143,6 +192,7 @@ class Command(DatabaseCommand):
                         # The batches before this one have committed. The
                         # candidates are the first rows still prunable, so a
                         # rerun starts again from this batch.
+                        self._partial_task_rows = deleted
                         raise CommandError(
                             f"Stopped after deleting {deleted} {label} task "
                             "row(s). The next batch hit a database deadlock or "
