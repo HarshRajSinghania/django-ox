@@ -151,6 +151,32 @@ class TestTheTimingOptionsAreChecked:
     def test_leaving_them_out_is_accepted(self, settings):
         assert "django_ox.E010" not in self._check(settings, {})
 
+    def test_backoff_initial_above_max_is_a_warning(self, settings):
+        ids = self._check(settings, {"BACKOFF_INITIAL": 60, "BACKOFF_MAX": 10})
+        assert "django_ox.W003" in ids
+        assert "django_ox.E010" not in ids
+
+    def test_equal_backoff_values_are_accepted(self, settings):
+        ids = self._check(settings, {"BACKOFF_INITIAL": 10, "BACKOFF_MAX": 10})
+        assert "django_ox.W003" not in ids
+        assert "django_ox.E010" not in ids
+
+    def test_backoff_initial_below_max_is_accepted(self, settings):
+        ids = self._check(settings, {"BACKOFF_INITIAL": 5, "BACKOFF_MAX": 10})
+        assert "django_ox.W003" not in ids
+
+    def test_missing_backoff_partner_is_not_compared(self, settings):
+        assert "django_ox.W003" not in self._check(settings, {"BACKOFF_INITIAL": 60})
+        assert "django_ox.W003" not in self._check(settings, {"BACKOFF_MAX": 1})
+
+    def test_invalid_backoff_is_e010_without_the_pair_warning(self, settings):
+        ids = self._check(settings, {"BACKOFF_INITIAL": -1, "BACKOFF_MAX": 10})
+        assert "django_ox.E010" in ids
+        assert "django_ox.W003" not in ids
+        ids = self._check(settings, {"BACKOFF_INITIAL": 60, "BACKOFF_MAX": 0})
+        assert "django_ox.E010" in ids
+        assert "django_ox.W003" not in ids
+
     def test_renew_interval_cannot_be_configured_above_lock_timeout(self):
         # A renewal slower than the lease it renews would lose every task.
         # It cannot be configured: the interval is derived from the lock
@@ -194,13 +220,42 @@ class TestTheLeaseTimingsRefuseWhatTheTimeoutOptionsRefuse:
         ],
     )
     def test_a_value_that_is_not_a_positive_finite_number_is_refused(self, name, value):
-        assert lease_timing_problems({name: value}), (
+        errors, warnings = lease_timing_problems({name: value})
+        assert errors, (
             f"{name}={value!r} passed the check and would reach the poll loop"
         )
+        assert warnings == []
 
     @pytest.mark.parametrize("value", [1, 300, 0.5, 300.0])
     def test_a_positive_finite_number_is_accepted(self, value):
-        assert lease_timing_problems({"LOCK_TIMEOUT": value}) == []
+        assert lease_timing_problems({"LOCK_TIMEOUT": value}) == ([], [])
 
     def test_an_absent_option_is_not_a_problem(self):
-        assert lease_timing_problems({}) == []
+        assert lease_timing_problems({}) == ([], [])
+
+    def test_backoff_initial_above_max_is_a_warning(self):
+        errors, warnings = lease_timing_problems(
+            {"BACKOFF_INITIAL": 60, "BACKOFF_MAX": 10}
+        )
+        assert errors == []
+        assert warnings
+        assert "60" in warnings[0]
+        assert "10" in warnings[0]
+        assert "BACKOFF_MAX" in warnings[0]
+
+    def test_equal_or_smaller_initial_is_not_a_warning(self):
+        assert lease_timing_problems({"BACKOFF_INITIAL": 10, "BACKOFF_MAX": 10}) == (
+            [],
+            [],
+        )
+        assert lease_timing_problems({"BACKOFF_INITIAL": 5, "BACKOFF_MAX": 10}) == (
+            [],
+            [],
+        )
+
+    def test_an_invalid_partner_skips_the_comparison(self):
+        errors, warnings = lease_timing_problems(
+            {"BACKOFF_INITIAL": -1, "BACKOFF_MAX": 10}
+        )
+        assert errors
+        assert warnings == []

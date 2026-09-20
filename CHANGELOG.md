@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `manage.py check` warns with `django_ox.W003` when `BACKOFF_INITIAL` is
+  greater than `BACKOFF_MAX`. Retries still run; every wait is the cap.
+
 ## [1.3.1] - 2026-09-20
 
 No code change since 1.3.0 except the version constant.
