@@ -165,6 +165,26 @@ class TestTheTimingOptionsAreChecked:
         ids = self._check(settings, {"BACKOFF_INITIAL": 5, "BACKOFF_MAX": 10})
         assert "django_ox.W003" not in ids
 
+    def test_the_pair_is_reported_as_a_warning_not_an_error(self, settings):
+        # The configuration runs, so `manage.py check` has to exit zero on
+        # it. As an Error it would refuse every deploy carrying the pair,
+        # and the id alone does not say which it is.
+        from django.core import checks
+
+        from django_ox.compat import default_task_backend
+
+        settings.TASKS = {
+            "default": {
+                "BACKEND": "django_ox.backend.OxBackend",
+                "QUEUES": ["default"],
+                "OPTIONS": {"BACKOFF_INITIAL": 60, "BACKOFF_MAX": 10},
+            }
+        }
+        reported = [m for m in default_task_backend.check() if m.id == "django_ox.W003"]
+        assert len(reported) == 1
+        assert reported[0].level == checks.WARNING
+        assert not reported[0].is_serious()
+
     def test_missing_backoff_partner_is_not_compared(self, settings):
         assert "django_ox.W003" not in self._check(settings, {"BACKOFF_INITIAL": 60})
         assert "django_ox.W003" not in self._check(settings, {"BACKOFF_MAX": 1})

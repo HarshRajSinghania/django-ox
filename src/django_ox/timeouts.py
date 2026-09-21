@@ -26,7 +26,7 @@ import time
 from collections.abc import Collection, Mapping
 from contextvars import ContextVar
 from datetime import datetime, timedelta
-from typing import Any
+from typing import Any, cast
 
 from django.core.exceptions import ImproperlyConfigured
 
@@ -182,8 +182,9 @@ def lease_timing_problems(
         if name not in options:
             continue
         try:
-            parsed[name] = _seconds(
-                options[name], f"OPTIONS[{name!r}]", unlimited=False
+            # A float here: unlimited=False refuses None.
+            parsed[name] = cast(
+                "float", _seconds(options[name], f"OPTIONS[{name!r}]", unlimited=False)
             )
         except ImproperlyConfigured as exc:
             problems.append(str(exc))
