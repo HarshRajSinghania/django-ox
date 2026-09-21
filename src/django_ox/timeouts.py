@@ -26,7 +26,7 @@ import time
 from collections.abc import Collection, Mapping
 from contextvars import ContextVar
 from datetime import datetime, timedelta
-from typing import Any
+from typing import Any, cast
 
 from django.core.exceptions import ImproperlyConfigured
 
@@ -154,29 +154,53 @@ def _seconds(value: Any, where: str, *, unlimited: bool = True) -> float | None:
 LEASE_TIMINGS = ("LOCK_TIMEOUT", "BACKOFF_INITIAL", "BACKOFF_MAX")
 
 
-def lease_timing_problems(options: Mapping[str, Any]) -> list[str]:
+def lease_timing_problems(
+    options: Mapping[str, Any],
+) -> tuple[list[str], list[str]]:
     """
-    Every way the worker's timing options are invalid, one sentence each.
+    Every way the worker's timing options are invalid or misleading.
 
-    Validated by the same helper as the timeout options, so the three lease
-    timings accept exactly what TASK_TIMEOUT accepts: a positive, finite
-    number of seconds, and nothing else. `True` is not one second and 1e300 is
-    not a duration.
+    Returns ``(errors, warnings)``. Errors are values that are not a
+    positive, finite number of seconds. Validated by the same helper as the
+    timeout options: `True` is not one second and 1e300 is not a duration.
 
-    Deliberately not a check on the relationships between them.
-    `renew_interval > lock_timeout` would be the pair worth refusing, and it
-    cannot be configured: the renewal interval is derived from the lock
-    timeout rather than read from options.
+    The one relationship this helper checks is `BACKOFF_INITIAL` above
+    `BACKOFF_MAX`. Both must be present and individually valid; otherwise
+    the existing per-option error stands and this pair is not compared.
+    Equal values are an intentional fixed delay and produce no message.
+    The comparison is a warning because retries still run: every wait is
+    `BACKOFF_MAX`.
+
+    `renew_interval > lock_timeout` would be the other pair worth refusing,
+    and it cannot be configured: the renewal interval is derived from the
+    lock timeout rather than read from options.
     """
     problems: list[str] = []
+    warnings: list[str] = []
+    parsed: dict[str, float] = {}
     for name in LEASE_TIMINGS:
         if name not in options:
             continue
         try:
-            _seconds(options[name], f"OPTIONS[{name!r}]", unlimited=False)
+            # A float here: unlimited=False refuses None.
+            parsed[name] = cast(
+                "float", _seconds(options[name], f"OPTIONS[{name!r}]", unlimited=False)
+            )
         except ImproperlyConfigured as exc:
             problems.append(str(exc))
-    return problems
+    if (
+        "BACKOFF_INITIAL" in parsed
+        and "BACKOFF_MAX" in parsed
+        and parsed["BACKOFF_INITIAL"] > parsed["BACKOFF_MAX"]
+    ):
+        initial = options["BACKOFF_INITIAL"]
+        maximum = options["BACKOFF_MAX"]
+        warnings.append(
+            f"OPTIONS['BACKOFF_INITIAL'] is {initial!r} and "
+            f"OPTIONS['BACKOFF_MAX'] is {maximum!r}; every retry waits "
+            "BACKOFF_MAX."
+        )
+    return problems, warnings
 
 
 def task_timeout_problems(

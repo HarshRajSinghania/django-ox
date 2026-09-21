@@ -310,7 +310,8 @@ class OxBackend(BaseTaskBackend):
                 )
         from .timeouts import lease_timing_problems, task_timeout_problems
 
-        for problem in lease_timing_problems(self.options):
+        timing_errors, timing_warnings = lease_timing_problems(self.options)
+        for problem in timing_errors:
             errors.append(
                 checks.Error(
                     problem,
@@ -319,6 +320,17 @@ class OxBackend(BaseTaskBackend):
                         "a positive, finite number of seconds."
                     ),
                     id="django_ox.E010",
+                )
+            )
+        for problem in timing_warnings:
+            errors.append(
+                checks.Warning(
+                    problem,
+                    hint=(
+                        "Lower BACKOFF_INITIAL so the first retry waits that "
+                        "delay, or raise BACKOFF_MAX to match it."
+                    ),
+                    id="django_ox.W003",
                 )
             )
 

@@ -262,6 +262,10 @@ alert are on the
   need not be the default.
 - `django_ox.E010`: `LOCK_TIMEOUT`, `BACKOFF_INITIAL` or `BACKOFF_MAX` is not a
   positive, finite number of seconds. The worker reads all three, so the check stops a bad value at deploy time.
+- `django_ox.W003`: `BACKOFF_INITIAL` and `BACKOFF_MAX` are both set to valid
+  numbers and the initial delay is above the cap. Every retry then waits
+  `BACKOFF_MAX`, so the configured first delay never takes effect. The
+  configuration still runs; lower the initial delay or raise the cap.
 
 The worker performs the same schedule and timeout validation at startup, so
 a bad deploy fails loudly rather than skipping dispatches.
