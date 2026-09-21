@@ -1,11 +1,13 @@
+import json
 import re
 import threading
 import time
 import uuid
-from datetime import timedelta
+from datetime import datetime, timedelta
 from io import StringIO
 
 import pytest
+from django.conf import settings
 from django.core.management import ManagementUtility, call_command
 from django.core.management.base import CommandError
 from django.db import (
@@ -1099,4 +1101,215 @@ class TestPruneAfterContention:
             prune(*self.ARGS)
 
         assert len(deletes) == 2
+        assert OxTask.objects.count() == 3
+
+
+@pytest.mark.django_db(transaction=True)
+class TestPruneJsonFormat:
+    def test_json_format_prunes_and_outputs_exact_schema(self):
+        old_ok = make_task(OxTask.Status.SUCCESSFUL, finished_days_ago=8)
+        make_task(OxTask.Status.FAILED, finished_days_ago=8)
+        make_tick("a", scheduled_days_ago=30)
+        latest_tick = make_tick("a", scheduled_days_ago=5)
+
+        out = prune("--format", "json")
+        data = json.loads(out)
+        # One line, so a cron line can pipe it straight into jq or a
+        # `while read` loop. json.loads() alone accepts pretty-printing.
+        assert out.strip() == json.dumps(data)
+
+        assert data["queue"] is None
+        assert data["statuses"] == ["SUCCESSFUL", "DISCARDED"]
+        assert data["task_rows"] == 1
+        assert data["tick_rows"] == 1
+        assert data["dry_run"] is False
+        assert "cutoff" in data
+        assert datetime.fromisoformat(data["cutoff"])
+        assert set(data.keys()) == {
+            "queue",
+            "cutoff",
+            "statuses",
+            "task_rows",
+            "tick_rows",
+            "dry_run",
+        }
+        assert not OxTask.objects.filter(pk=old_ok.pk).exists()
+        assert OxScheduleTick.objects.filter(pk=latest_tick.pk).exists()
+
+    def test_json_format_with_queue(self):
+        emails = make_task(
+            OxTask.Status.SUCCESSFUL, finished_days_ago=8, queue_name="emails"
+        )
+        reports = make_task(
+            OxTask.Status.SUCCESSFUL, finished_days_ago=8, queue_name="reports"
+        )
+
+        out = prune("--format", "json", "--queue", "emails")
+        data = json.loads(out)
+
+        assert data["queue"] == "emails"
+        assert data["task_rows"] == 1
+        assert not OxTask.objects.filter(pk=emails.pk).exists()
+        assert OxTask.objects.filter(pk=reports.pk).exists()
+
+    def test_json_format_include_failed(self):
+        make_task(OxTask.Status.SUCCESSFUL, finished_days_ago=8)
+        make_task(OxTask.Status.FAILED, finished_days_ago=8)
+        make_task(OxTask.Status.LOST, finished_days_ago=8)
+
+        out = prune("--format", "json", "--include-failed")
+        data = json.loads(out)
+
+        assert data["statuses"] == ["SUCCESSFUL", "DISCARDED", "FAILED", "LOST"]
+        assert data["task_rows"] == 3
+        assert OxTask.objects.count() == 0
+
+    def test_json_format_dry_run(self):
+        make_task(OxTask.Status.SUCCESSFUL, finished_days_ago=8)
+        make_tick("a", scheduled_days_ago=30)
+        make_tick("a", scheduled_days_ago=5)
+
+        out = prune("--format", "json", "--dry-run")
+        data = json.loads(out)
+
+        assert data["dry_run"] is True
+        assert data["task_rows"] == 1
+        assert data["tick_rows"] == 1
+        assert OxTask.objects.count() == 1
+        assert OxScheduleTick.objects.count() == 2
+
+    TICK_DELETE = "DELETE FROM DJANGO_OX_OXSCHEDULETICK"
+
+    def test_text_format_reports_task_rows_when_tick_pruning_fails(self):
+        # The task rows are gone whatever happens next. A failure while
+        # pruning ticks must not take their count with it.
+        make_old_rows(2, OxTask.Status.SUCCESSFUL)
+        make_tick("a", scheduled_days_ago=30)
+        make_tick("a", scheduled_days_ago=5)
+
+        out = StringIO()
+        with (
+            failing(
+                self.TICK_DELETE, lambda: simulated("mysql-deadlock"), lambda n: n == 1
+            ),
+            pytest.raises(DatabaseError),
+        ):
+            call_command("ox_prune", stdout=out)
+
+        body = out.getvalue()
+        assert "Deleted 2" in body
+        assert "task row(s)" in body
+        assert "schedule tick row(s)" not in body
+
+    def test_json_format_reports_task_rows_when_tick_pruning_fails(self):
+        make_old_rows(2, OxTask.Status.SUCCESSFUL)
+        make_tick("a", scheduled_days_ago=30)
+        make_tick("a", scheduled_days_ago=5)
+
+        out = StringIO()
+        with (
+            failing(
+                self.TICK_DELETE, lambda: simulated("mysql-deadlock"), lambda n: n == 1
+            ),
+            pytest.raises(DatabaseError),
+        ):
+            call_command("ox_prune", "--format", "json", stdout=out)
+
+        data = json.loads(out.getvalue())
+        assert data["task_rows"] == 2
+        assert data["tick_rows"] == 0
+        assert data["dry_run"] is False
+
+    def test_json_format_reports_tick_rows_deleted_before_a_failure(self):
+        make_tick("a", scheduled_days_ago=5)
+        for days in (40, 39, 38, 37):
+            make_tick("a", scheduled_days_ago=days)
+
+        out = StringIO()
+        with (
+            failing(
+                self.TICK_DELETE, lambda: simulated("mysql-deadlock"), lambda n: n == 2
+            ),
+            pytest.raises(DatabaseError),
+        ):
+            call_command("ox_prune", "--format", "json", "--batch-size=1", stdout=out)
+
+        data = json.loads(out.getvalue())
+        assert data["tick_rows"] == 1
+
+    def test_json_format_cutoff_follows_older_than(self):
+        before = timezone.now()
+        out = prune("--format", "json", "--older-than", "30d")
+        after = timezone.now()
+
+        cutoff = datetime.fromisoformat(json.loads(out)["cutoff"])
+        # Aware or naive follows USE_TZ, the way timezone.now() does. The
+        # naive settings modules run this too.
+        assert (cutoff.utcoffset() is not None) is settings.USE_TZ
+        assert before - timedelta(days=30) <= cutoff <= after - timedelta(days=30)
+
+    @pytest.mark.parametrize("kind", CONTENTION)
+    def test_json_format_contention_reports_partial_task_rows(self, kind):
+        make_old_rows(5, OxTask.Status.FAILED)
+
+        out = StringIO()
+        with (
+            failing(
+                TestPruneAfterContention.DELETE,
+                lambda: simulated(kind),
+                lambda n: n >= 2,
+            ),
+            pytest.raises(CommandError),
+        ):
+            call_command(
+                "ox_prune",
+                "--format",
+                "json",
+                "--include-failed",
+                "--batch-size=2",
+                stdout=out,
+            )
+
+        data = json.loads(out.getvalue())
+        assert data["task_rows"] == 2
+        assert data["tick_rows"] == 0
+        assert data["dry_run"] is False
+        assert data["statuses"] == ["SUCCESSFUL", "DISCARDED", "FAILED", "LOST"]
+        assert OxTask.objects.count() == 3
+
+    @pytest.mark.parametrize("kind", CONTENTION)
+    def test_json_format_contention_command_line_exit_non_zero(
+        self, kind, monkeypatch, capsys
+    ):
+        make_old_rows(5, OxTask.Status.FAILED)
+        pauses = []
+        monkeypatch.setattr("django_ox._contention.pause", pauses.append)
+        argv = [
+            "manage.py",
+            "ox_prune",
+            "--format",
+            "json",
+            "--include-failed",
+            "--batch-size=2",
+            "--skip-checks",
+        ]
+
+        with (
+            failing(
+                TestPruneAfterContention.DELETE,
+                lambda: simulated(kind),
+                lambda n: n >= 2,
+            ),
+            pytest.raises(SystemExit) as info,
+        ):
+            ManagementUtility(argv).execute()
+
+        assert info.value.code == 1
+        captured = capsys.readouterr()
+        data = json.loads(captured.out)
+        assert data["task_rows"] == 2
+        assert data["tick_rows"] == 0
+        assert data["dry_run"] is False
+        assert "Stopped after deleting 2 " in captured.err
+        assert pauses == [1, 2]
         assert OxTask.objects.count() == 3
