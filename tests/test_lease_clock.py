@@ -186,14 +186,17 @@ class TestTheTimingOptionsAreChecked:
         assert not reported[0].is_serious()
 
     def test_missing_backoff_partner_is_not_compared(self, settings):
-        assert "django_ox.W003" not in self._check(settings, {"BACKOFF_INITIAL": 60})
+        assert "django_ox.W003" not in self._check(settings, {"BACKOFF_INITIAL": 700})
         assert "django_ox.W003" not in self._check(settings, {"BACKOFF_MAX": 1})
 
-    def test_invalid_backoff_is_e010_without_the_pair_warning(self, settings):
-        ids = self._check(settings, {"BACKOFF_INITIAL": -1, "BACKOFF_MAX": 10})
-        assert "django_ox.E010" in ids
-        assert "django_ox.W003" not in ids
-        ids = self._check(settings, {"BACKOFF_INITIAL": 60, "BACKOFF_MAX": 0})
+    @pytest.mark.parametrize("side", ["BACKOFF_INITIAL", "BACKOFF_MAX"])
+    @pytest.mark.parametrize("bad", [True, 0, 1e300, float("inf"), "300", None])
+    def test_invalid_backoff_is_e010_without_the_pair_warning(
+        self, side, bad, settings
+    ):
+        ids = self._check(
+            settings, {"BACKOFF_INITIAL": 60, "BACKOFF_MAX": 0.5, side: bad}
+        )
         assert "django_ox.E010" in ids
         assert "django_ox.W003" not in ids
 
@@ -258,10 +261,9 @@ class TestTheLeaseTimingsRefuseWhatTheTimeoutOptionsRefuse:
             {"BACKOFF_INITIAL": 60, "BACKOFF_MAX": 10}
         )
         assert errors == []
-        assert warnings
-        assert "60" in warnings[0]
-        assert "10" in warnings[0]
-        assert "BACKOFF_MAX" in warnings[0]
+        assert len(warnings) == 1
+        assert "OPTIONS['BACKOFF_INITIAL'] is 60 " in warnings[0]
+        assert "OPTIONS['BACKOFF_MAX'] is 10;" in warnings[0]
 
     def test_equal_or_smaller_initial_is_not_a_warning(self):
         assert lease_timing_problems({"BACKOFF_INITIAL": 10, "BACKOFF_MAX": 10}) == (
@@ -273,9 +275,27 @@ class TestTheLeaseTimingsRefuseWhatTheTimeoutOptionsRefuse:
             [],
         )
 
-    def test_an_invalid_partner_skips_the_comparison(self):
+    @pytest.mark.parametrize("side", ["BACKOFF_INITIAL", "BACKOFF_MAX"])
+    @pytest.mark.parametrize(
+        "value",
+        [
+            True,
+            False,
+            1e300,
+            1e400,
+            float("inf"),
+            float("nan"),
+            0,
+            -1,
+            "300",
+            None,
+            [300],
+        ],
+    )
+    def test_an_invalid_partner_skips_the_comparison(self, side, value):
+        assert lease_timing_problems({"BACKOFF_INITIAL": 60, "BACKOFF_MAX": 0.5})[1]
         errors, warnings = lease_timing_problems(
-            {"BACKOFF_INITIAL": -1, "BACKOFF_MAX": 10}
+            {"BACKOFF_INITIAL": 60, "BACKOFF_MAX": 0.5, side: value}
         )
         assert errors
         assert warnings == []

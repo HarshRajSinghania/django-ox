@@ -4560,8 +4560,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `ox_prune --format json` prints the prune counts as one JSON object,
   for scripts that would otherwise parse the two report lines.
-- `manage.py check` warns with `django_ox.W003` when `BACKOFF_INITIAL` is
-  greater than `BACKOFF_MAX`. Retries still run; every wait is the cap.
+- `manage.py check` warns with `django_ox.W003` when `BACKOFF_INITIAL` and
+  `BACKOFF_MAX` are both explicitly set to valid numbers in `OPTIONS` and
+  the initial delay is above the cap. Retries still run. As before,
+  every retry waits `BACKOFF_MAX` in this configuration.
 
 ### Fixed
 
