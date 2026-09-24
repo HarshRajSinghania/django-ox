@@ -4,6 +4,8 @@ import ast
 import re
 from pathlib import Path
 
+import pytest
+
 SRC = Path(__file__).resolve().parent.parent / "src"
 DOC = Path(__file__).resolve().parent.parent / "docs" / "monitoring.md"
 
@@ -50,12 +52,6 @@ def test_every_event_is_documented():
 # passes is worse than the gap it covers.
 
 
-# Keys that _log_extra() always attaches. Keyword extras on a call are
-# collected separately; _complete() is not treated as a keyword helper
-# because its extras live in a literal dictionary on the logger call.
-_LOG_EXTRA_FIXED = frozenset(
-    {"event", "task_id", "task_path", "queue", "attempt", "worker_id"}
-)
 _KEY_TABLE_START = "| Key | Present on | Meaning |"
 
 
@@ -72,11 +68,54 @@ def _literal_str_keys(node: ast.AST) -> set[str] | None:
     return keys
 
 
+def log_extra_fixed_keys(helper: ast.FunctionDef) -> set[str]:
+    """The keys a _log_extra() definition always attaches, from its return."""
+    returns = [node for node in ast.walk(helper) if isinstance(node, ast.Return)]
+    if len(returns) != 1 or not isinstance(returns[0].value, ast.Dict):
+        raise AssertionError(
+            "_log_extra must return one dict literal for its keys to be inventoried"
+        )
+    own_extra = helper.args.kwarg.arg if helper.args.kwarg else None
+    keys: set[str] = set()
+    for key, value in zip(returns[0].value.keys, returns[0].value.values, strict=True):
+        if key is None:
+            # The helper's own **extra: those keys are the call's keywords.
+            # Any other spread would add keys no call site shows.
+            if isinstance(value, ast.Name) and value.id == own_extra:
+                continue
+            raise AssertionError(
+                f"_log_extra spreads a mapping the scanner cannot read: "
+                f"{ast.dump(value)}"
+            )
+        if not (isinstance(key, ast.Constant) and isinstance(key.value, str)):
+            raise AssertionError(
+                f"_log_extra returns a key the scanner cannot read: {ast.dump(key)}"
+            )
+        keys.add(key.value)
+    return keys
+
+
 def emitted_extra_keys() -> set[str]:
     """Collect structured-log extra keys the package actually emits."""
+    trees = {
+        path: ast.parse(path.read_text(), filename=str(path))
+        for path in SRC.rglob("*.py")
+    }
+    # Every _log_extra call is credited with one definition's fixed keys, so
+    # a second definition anywhere would have its own keys go unread.
+    helpers = [
+        node
+        for tree in trees.values()
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "_log_extra"
+    ]
+    if len(helpers) != 1:
+        raise AssertionError(
+            f"src/ must define _log_extra exactly once, not {len(helpers)} times"
+        )
+    fixed = log_extra_fixed_keys(helpers[0])
     keys: set[str] = set()
-    for path in SRC.rglob("*.py"):
-        tree = ast.parse(path.read_text(), filename=str(path))
+    for path, tree in trees.items():
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
                 continue
@@ -111,8 +150,11 @@ def emitted_extra_keys() -> set[str]:
                 if isinstance(func, ast.Attribute)
                 else (func.id if isinstance(func, ast.Name) else None)
             )
+            # Keyword extras on a _log_extra() call are collected at each call;
+            # _complete() is not treated as a keyword helper because its extras
+            # live in a literal dictionary on the logger call.
             if name == "_log_extra":
-                keys |= set(_LOG_EXTRA_FIXED)
+                keys |= fixed
                 for kw in node.keywords:
                     if kw.arg is None:
                         raise AssertionError(
@@ -145,6 +187,34 @@ def documented_extra_keys() -> set[str]:
         first = line.split("|", 2)[1]
         keys |= set(re.findall(r"`([a-z_]+)`", first))
     return keys
+
+
+def _helper(source: str) -> ast.FunctionDef:
+    helper = ast.parse(source).body[0]
+    assert isinstance(helper, ast.FunctionDef)
+    return helper
+
+
+def test_fixed_keys_are_read_from_the_helper_return():
+    helper = _helper(
+        "def _log_extra(self, event, db_task, **extra):\n"
+        "    return {'event': event, 'new_fixed_key': 1, **extra}\n"
+    )
+    assert log_extra_fixed_keys(helper) == {"event", "new_fixed_key"}
+
+
+@pytest.mark.parametrize(
+    "entry",
+    ["**self.identity()", "KEY_NAME: 1"],
+    ids=["other-spread", "non-literal-key"],
+)
+def test_fixed_keys_refuse_an_entry_the_scanner_cannot_read(entry):
+    helper = _helper(
+        "def _log_extra(self, event, db_task, **extra):\n"
+        f"    return {{'event': event, {entry}, **extra}}\n"
+    )
+    with pytest.raises(AssertionError, match="the scanner cannot read"):
+        log_extra_fixed_keys(helper)
 
 
 def test_every_emitted_extra_key_is_documented():
