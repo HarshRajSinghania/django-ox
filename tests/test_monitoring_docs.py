@@ -149,9 +149,7 @@ def documented_extra_keys() -> set[str]:
 
 def test_every_emitted_extra_key_is_documented():
     # This guard requires emitted keys to be documented. It does not
-    # require every documented key to originate in the scanned source:
-    # the key table also names fields assembled outside those extra=
-    # dictionaries, and a reverse check would fail them as false gaps.
+    # require every documented key to have an emitter the scanner can see.
     documented = documented_extra_keys()
     emitted = emitted_extra_keys()
     assert len(emitted) >= 35, f"the extra-key scanner found only {len(emitted)}"
