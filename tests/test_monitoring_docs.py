@@ -1,4 +1,4 @@
-"""Every log event the package emits is documented."""
+"""Every log event and structured-log extra key the package emits is documented."""
 
 import ast
 import re
@@ -222,6 +222,8 @@ def test_every_emitted_extra_key_is_documented():
     # require every documented key to have an emitter the scanner can see.
     documented = documented_extra_keys()
     emitted = emitted_extra_keys()
+    # A floor, as for events: a scanner that stops matching reports too few
+    # keys and fails here rather than passing with little to check.
     assert len(emitted) >= 35, f"the extra-key scanner found only {len(emitted)}"
     missing = sorted(emitted - documented)
     assert not missing, (
