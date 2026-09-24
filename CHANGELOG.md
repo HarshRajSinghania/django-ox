@@ -10,8 +10,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - Documented the `worker_class` structured log key on
-  `claim_filter_sql_missing`, and added a source-to-documentation check so
-  emitted extra keys cannot drift out of `docs/monitoring.md` unnoticed.
+  `claim_filter_sql_missing` and added a source-to-documentation test for
+  structured-log extra keys.
 
 ### Added
 
