@@ -102,11 +102,14 @@ def emitted_extra_keys() -> set[str]:
                     if helper != "_log_extra":
                         raise AssertionError(
                             f"{path}:{node.lineno}: extra= form the scanner "
-                            f"cannot understand: {ast.dump(extra_kw.value, include_attributes=False)}"
+                            "cannot understand: "
+                            f"{ast.dump(extra_kw.value, include_attributes=False)}"
                         )
             func = node.func
-            name = func.attr if isinstance(func, ast.Attribute) else (
-                func.id if isinstance(func, ast.Name) else None
+            name = (
+                func.attr
+                if isinstance(func, ast.Attribute)
+                else (func.id if isinstance(func, ast.Name) else None)
             )
             if name == "_log_extra":
                 keys |= set(_LOG_EXTRA_FIXED)
@@ -154,6 +157,5 @@ def test_every_emitted_extra_key_is_documented():
     assert len(emitted) >= 35, f"the extra-key scanner found only {len(emitted)}"
     missing = sorted(emitted - documented)
     assert not missing, (
-        "structured log keys with no row in docs/monitoring.md: "
-        f"{missing}"
+        f"structured log keys with no row in docs/monitoring.md: {missing}"
     )
