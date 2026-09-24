@@ -1,5 +1,6 @@
 """Every log event the package emits is documented."""
 
+import ast
 import re
 from pathlib import Path
 
@@ -47,3 +48,112 @@ def test_every_event_is_documented():
 # any cheap parse, so such a check would either need the doc structure
 # hard-coded or pass by matching too little. A test weakened until it
 # passes is worse than the gap it covers.
+
+
+# Keys that _log_extra() always attaches. Keyword extras on a call are
+# collected separately; _complete() is not treated as a keyword helper
+# because its extras live in a literal dictionary on the logger call.
+_LOG_EXTRA_FIXED = frozenset(
+    {"event", "task_id", "task_path", "queue", "attempt", "worker_id"}
+)
+_KEY_TABLE_START = "| Key | Present on | Meaning |"
+
+
+def _literal_str_keys(node: ast.AST) -> set[str] | None:
+    """Return string keys of a dict literal, or None if it is not one."""
+    if not isinstance(node, ast.Dict):
+        return None
+    keys: set[str] = set()
+    for key in node.keys:
+        if isinstance(key, ast.Constant) and isinstance(key.value, str):
+            keys.add(key.value)
+        else:
+            return None
+    return keys
+
+
+def emitted_extra_keys() -> set[str]:
+    """Collect structured-log extra keys the package actually emits."""
+    keys: set[str] = set()
+    for path in SRC.rglob("*.py"):
+        tree = ast.parse(path.read_text(), filename=str(path))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            extra_kw = next((kw for kw in node.keywords if kw.arg == "extra"), None)
+            if extra_kw is not None:
+                parsed = _literal_str_keys(extra_kw.value)
+                if parsed is not None:
+                    keys |= parsed
+                else:
+                    value = extra_kw.value
+                    helper = None
+                    if isinstance(value, ast.Call):
+                        func = value.func
+                        helper = (
+                            func.attr
+                            if isinstance(func, ast.Attribute)
+                            else func.id
+                            if isinstance(func, ast.Name)
+                            else None
+                        )
+                    # extra=self._log_extra(...) is inventoried when the
+                    # helper call itself is walked; it is not an unknown form.
+                    if helper != "_log_extra":
+                        raise AssertionError(
+                            f"{path}:{node.lineno}: extra= form the scanner "
+                            f"cannot understand: {ast.dump(extra_kw.value, include_attributes=False)}"
+                        )
+            func = node.func
+            name = func.attr if isinstance(func, ast.Attribute) else (
+                func.id if isinstance(func, ast.Name) else None
+            )
+            if name == "_log_extra":
+                keys |= set(_LOG_EXTRA_FIXED)
+                for kw in node.keywords:
+                    if kw.arg is None:
+                        raise AssertionError(
+                            f"{path}:{node.lineno}: _log_extra(**kwargs) is "
+                            "not a form the scanner can inventory"
+                        )
+                    keys.add(kw.arg)
+    return keys
+
+
+def documented_extra_keys() -> set[str]:
+    """Backticked keys in the first cell of the structured-log key table."""
+    text = DOC.read_text()
+    start = text.find(_KEY_TABLE_START)
+    assert start != -1, "structured log key table is missing from docs/monitoring.md"
+    rest = text[start:]
+    # The table ends at the next blank line after its header.
+    lines = rest.splitlines()
+    table: list[str] = []
+    for line in lines:
+        if not line.strip():
+            if table:
+                break
+            continue
+        table.append(line)
+    keys: set[str] = set()
+    for line in table[2:]:  # skip header and separator
+        if not line.startswith("|"):
+            break
+        first = line.split("|", 2)[1]
+        keys |= set(re.findall(r"`([a-z_]+)`", first))
+    return keys
+
+
+def test_every_emitted_extra_key_is_documented():
+    # This guard requires emitted keys to be documented. It does not
+    # require every documented key to originate in the scanned source:
+    # the key table also names fields assembled outside those extra=
+    # dictionaries, and a reverse check would fail them as false gaps.
+    documented = documented_extra_keys()
+    emitted = emitted_extra_keys()
+    assert len(emitted) >= 35, f"the extra-key scanner found only {len(emitted)}"
+    missing = sorted(emitted - documented)
+    assert not missing, (
+        "structured log keys with no row in docs/monitoring.md: "
+        f"{missing}"
+    )
