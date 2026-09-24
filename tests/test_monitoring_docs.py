@@ -8,10 +8,13 @@ DOC = Path(__file__).resolve().parent.parent / "docs" / "monitoring.md"
 
 
 #: Events are emitted two ways: an inline `extra={"event": "..."}`, and as
-#: the first argument to Worker._log_extra. Both are matched, or the
-#: coverage claim below is not true.
+#: the first argument to a Worker helper that builds the extra itself,
+#: _log_extra or _complete. Both are matched, or the coverage claim below
+#: is not true.
 _INLINE = re.compile(r'"event":\s*"([a-z_]+)"')
-_HELPER = re.compile(r'_log_extra\(\s*"([a-z_]+)"')
+_HELPER = re.compile(r'\b(?:_log_extra|_complete)\(\s*"([a-z_]+)"')
+#: The first cell of a table row, where the events table names each event.
+_ROW = re.compile(r"^\| `([a-z_]+)` \|", re.MULTILINE)
 
 
 def emitted_events() -> set[str]:
@@ -30,8 +33,12 @@ def test_every_event_is_documented():
     # A floor, so a regex that stops matching reports an empty set and fails
     # here rather than passing with nothing to check.
     assert len(events) >= 30, f"the event scanner found only {len(events)}"
-    missing = sorted(e for e in events if f"`{e}`" not in documented)
-    assert not missing, f"events with no entry in docs/monitoring.md: {missing}"
+    # A row of its own rather than a mention: most events are also named in
+    # the key table or the prose, which would still be there for an event
+    # whose own row was deleted.
+    rows = set(_ROW.findall(documented))
+    missing = sorted(events - rows)
+    assert not missing, f"events with no row in docs/monitoring.md: {missing}"
 
 
 # There is deliberately no test for the reverse direction, a documented
