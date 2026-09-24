@@ -44,7 +44,35 @@ Run `python manage.py migrate django_ox` to create the table.
 | Worker | `manage.py db_worker` | `manage.py ox_worker` |
 | Clean up finished rows | `manage.py prune_db_task_results` | `manage.py ox_prune --older-than 7d` |
 
-Nothing else moves. Same decorator, same `.enqueue()`, same result API.
+The decorator, `.enqueue()`, and result API stay the same. Worker options
+and queue selection differ.
+
+Of `db_worker`'s worker-specific options, `--backend`, `--interval`,
+`--batch` and `--max-tasks` carry over by name.
+
+- Replace `--queue-name` with `--queues`.
+- `--batch` maps by name to `--batch`. In `ox_worker`, it ends after an
+  error-free empty claim pass with no local tasks in flight; it does not
+  wait for future tasks, retry backoff or deferred releases. `db_worker`
+  exits with a traceback when the database is unreachable or its tables are
+  missing. `ox_worker` keeps retrying, a failed schedule dispatch included,
+  and doesn't end the batch until a retry succeeds. Give the job a timeout,
+  as [Running as a job](production.md#running-as-a-job) explains.
+- `--max-tasks N` maps by name to `--max-tasks N`. In `ox_worker`, every
+  claimed attempt consumes one of N, including failed attempts and repeat
+  claims of the same task. These mappings do not imply identical completion
+  or retry semantics between the workers.
+- Remove `--reload`, `--no-reload`, `--exclude-queues`, `--worker-id`, and
+  `--no-startup-delay`. `ox_worker` rejects these options as unrecognized
+  arguments.
+- `ox_worker` does not autoreload. Without `--batch`, `db_worker` enables
+  autoreload by default when `settings.DEBUG` is true.
+- `db_worker` runs only the `default` queue unless configured otherwise.
+  `ox_worker` runs every configured queue unless `--queues` selects queues.
+  Use `--queues default` to preserve the old default.
+
+Do not use `--queues '*'` to select all queues. `*` is treated as a literal
+queue name, not a wildcard. Omit `--queues` to run every configured queue.
 
 ## From Celery
 
@@ -178,6 +206,8 @@ left to run it.
 3. **Deploy django-ox.** Run `migrate django_ox`, then switch `TASKS`.
 4. **Start `ox_worker`** and check it picks up work. `manage.py ox_health` will
    tell you, and the worker logs every claim to the `django_ox` logger.
+   Using Django's PostgreSQL pool? First check
+   [pool sizing](production.md#database-connections-and-postgresql-pooling).
 5. **Retire the old worker,** then its tables and broker.
 
 No drain window available? Run both. Old workers keep serving the old table

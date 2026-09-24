@@ -50,13 +50,13 @@ Execution is at-least-once: make tasks safe to repeat.
 
 Enqueue inside `transaction.atomic()` on the database holding `OxTask`, and the task commits or rolls back with your application data. No `transaction.on_commit()` needed.
 
-Inspect attempts in Django admin, then retry or discard tasks there. Edit recurring schedules in admin or declare them in settings; workers dispatch them without a scheduler process.
+Inspect attempts and retry or discard tasks in Django admin. Open **Queue overview** from the task change list to compare queues. Edit recurring schedules in admin or declare them in settings; workers dispatch them without a scheduler process.
 
 For deployment probes, `ox_health` turns queue thresholds into an exit code, with `--format json` for structured output. Monitor through `django_ox.stats` or `/ox/metrics`, and clear finished rows with `ox_prune`. Use `--database` on `ox_worker`, `ox_prune` and `ox_health` to select the database alias.
 
 In the [published benchmarks](https://oxpull.com/django-ox/benchmarks/), 2,000 of 2,000 tasks finished after 20 worker kills per trial, queue drain was up to 20% faster than django-tasks-db, and enqueueing 10,000 tasks took 0.71 s.
 
-992 test functions, with CI covering Python 3.12 to 3.14, Django 5.2 to 6.1, PostgreSQL, MySQL and SQLite. Open source under the BSD 3-Clause licence.
+1,086 test functions, with CI covering Python 3.12 to 3.14, Django 5.2 to 6.1, PostgreSQL, MySQL and SQLite. Open source under the BSD 3-Clause licence.
 
 Need to coordinate work across tasks? [Oxpull Pro](https://oxpull.com/) adds batches, unique tasks, rate limiting and workflows.
 
@@ -91,7 +91,7 @@ limit, keeping the full traceback of every attempt.
 ## Measured
 
 [The benchmarks page](https://oxpull.com/django-ox/benchmarks/) compares
-django-ox with `django-tasks-db`, the other database backend for the Tasks
+django-ox with `django-tasks-db`, another database backend for the Tasks
 framework, on one machine with both arms on Django core `django.tasks` and
 PostgreSQL 16: backlog drain at two queue depths with matched worker
 processes, enqueue latency, bulk enqueue, worker death under repeated SIGKILL
@@ -129,7 +129,7 @@ TASKS = {
         "QUEUES": ["default", "emails"],  # [] allows any queue name
         "OPTIONS": {
             "MAX_ATTEMPTS": 3,  # claims per task before FAILED
-            "LOCK_TIMEOUT": 300,  # seconds before a dead worker's task is reclaimed
+            "LOCK_TIMEOUT": 300,  # seconds a worker may stop renewing its lease
             "BACKOFF_INITIAL": 5,  # first retry delay, seconds; doubles per attempt
             "BACKOFF_MAX": 600,  # retry delay ceiling, seconds
         },
@@ -165,11 +165,13 @@ python manage.py ox_worker
 | --- | --- | --- |
 | `--backend` | `default` | Backend alias from the `TASKS` setting. |
 | `--queues` | all configured queues | Comma-separated queue names to process. |
-| `--concurrency` | `1` | Tasks executed concurrently (thread pool). |
-| `--processes` | `1` | Worker processes under one supervisor. Each is a full worker with its own connections, reaper and `--concurrency` thread pool; a process that dies is restarted. POSIX only. |
+| `--concurrency` | `1` | Tasks executed concurrently (thread pool). With Django's PostgreSQL pool, check [pool sizing](https://oxpull.com/django-ox/production/#database-connections-and-postgresql-pooling). |
+| `--processes` | `1` | Worker processes under one supervisor. Each is a full worker with its own connections, reaper and `--concurrency` thread pool; budget database connections per process. A process that dies is restarted. POSIX only. |
 | `--interval` | `1.0` | Polling interval in seconds when idle. |
 | `--lock-timeout` | backend `LOCK_TIMEOUT` | Seconds a RUNNING task's lock may go unrefreshed before the task is reclaimed. |
 | `--database` | the alias `OxTask` writes to | Database alias to run against. Every `--processes` child is given the same one. It is not checked against the router. |
+| `--batch` | off | Exit once a poll pass finds nothing to claim and none of its own tasks is running. For cron and job runners. Single process only. |
+| `--max-tasks N` | none | Exit after claiming N task attempts, failed attempts and retries included. Single process only. |
 
 On SIGTERM or SIGINT the worker stops claiming, finishes in-flight tasks, then
 exits. A second signal forces an immediate exit. With `--processes` above 1,
@@ -192,6 +194,7 @@ python manage.py ox_prune --older-than 7d
 | `--include-failed` | off | Also delete FAILED and LOST rows. By default they are kept: they hold the per-attempt tracebacks and can be retried. |
 | `--batch-size` | `1000` | Rows per DELETE statement, so pruning a large table never takes a long lock or builds a giant IN clause. |
 | `--dry-run` | off | Report how many rows would be deleted without deleting any. |
+| `--format` | `text` | `json` prints one object on stdout instead of the two report lines: `queue`, `cutoff`, `statuses`, `task_rows`, `tick_rows` and `dry_run`. `queue` is `null` when no `--queue` is given, `cutoff` is ISO 8601, and `statuses` is a list. On a database error during deletion, the object is printed too, with counts of rows already deleted in committed batches, before the same non-zero exit. |
 | `--database` | the alias `OxTask` writes to | Database alias to prune. The rows it reads and the rows it deletes are on that one alias. |
 
 Only SUCCESSFUL and DISCARDED rows (and, with `--include-failed`, FAILED and
@@ -225,13 +228,25 @@ Mounting `path("ox/", include("django_ox.urls"))` exposes `GET /ox/metrics`,
 the same numbers as Prometheus gauges; the view has no authentication of its
 own.
 
-When `django.contrib.admin` is installed, the task table is registered with
-it: a filterable list, a read-only detail page with every attempt's
-traceback, and **Retry selected tasks** and **Discard selected tasks**
-actions. The same two operations are `django_ox.actions.retry(result_id)`
-and `django_ox.actions.discard(result_id)`. A retry is one more attempt on
-a FAILED or LOST task; a discard closes a READY, WAITING, FAILED or LOST task
+When `django.contrib.admin` is installed, django-ox registers a filterable
+task list and a read-only detail page with every attempt's traceback. The
+list provides **Retry selected tasks** and **Discard selected tasks**
+actions. The same operations are `django_ox.actions.retry(result_id)` and
+`django_ox.actions.discard(result_id)`. A retry is one more attempt on a
+FAILED or LOST task; a discard closes a READY, WAITING, FAILED or LOST task
 without running it. Neither touches a running task.
+
+Open **Queue overview** from the task change list to compare retained status
+counts, eligible READY tasks, the oldest eligible task's age, five-minute
+throughput and failure rate, and time since the last claim. READY includes
+deferred tasks; Eligible ready excludes them. Status totals are retained
+rows, not lifetime counts.
+
+Each visit scans retained task rows, so cost grows with retention. The page
+does not refresh automatically. It uses the database alias selected by
+`router.db_for_write(OxTask)`. To show rows processed by
+`ox_worker --database other`, that router selection must also resolve to
+`other`.
 
 Worker lifecycle events (claim, start, success, retry, failure, reclaim,
 shutdown) log to the `django_ox` logger with stable extra keys (task id,

@@ -21,13 +21,17 @@ export names this page does not list; those names are not public.
 - **The management commands** and their flags: `ox_worker`, `ox_prune`,
   `ox_health`. `ox_worker`'s exit codes: 0 after a drain, 130 on a forced
   exit, 75 when the worker recycles itself after a stuck task thread.
+  A worker that finishes under `--batch` or `--max-tasks` drains and exits
+  0, even when attempts failed; each outcome stays on its task row. An
+  invalid `--max-tasks`, or either flag with `--processes` above 1, exits 1
+  before any worker starts.
   Under `--processes`, the supervisor exits 0 when every worker drained
   or recycled, 1 when a slot hit the restart cap, and otherwise with the
   first other non-zero worker code. A worker killed by a signal reports
   `128 + the signal number`, following the shell convention.
-- **The system check IDs**, the `django_ox.E0xx` identifiers, which
-  you may list in `SILENCED_SYSTEM_CHECKS`. The
-  IDs are stable; the messages are not.
+- **The system check IDs**, including the `django_ox.E0xx` and
+  `django_ox.W0xx` identifiers, which you may list in
+  `SILENCED_SYSTEM_CHECKS`. The IDs are stable; the messages are not.
 - **`ox_health`'s exit codes**: 0 when healthy, 1 when unhealthy. A value
   the command itself rejects exits 1 as well, such as `--max-age 0` or a
   `--database` alias that isn't in `DATABASES`. A value argparse rejects
@@ -115,7 +119,7 @@ process that shares a database before anything writes the new status. The
 release notes name the value, say how it reads through `django.tasks`, and
 give the upgrade and rollback steps.
 
-Pin accordingly: `django-ox~=1.3.1` accepts patch releases only;
+Pin accordingly: `django-ox~=1.4.0` accepts patch releases only;
 `django-ox~=1.3` accepts the current major line.
 
 ## Deprecation policy
