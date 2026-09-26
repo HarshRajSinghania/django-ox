@@ -9,6 +9,9 @@ cooperative task give up early.
 """
 
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
+from datetime import datetime
 
 import pytest
 from django.utils import timezone
@@ -16,6 +19,29 @@ from django.utils import timezone
 from django_ox.timeouts import _deadline, _deadline_monotonic, deadline, remaining
 
 pytestmark = pytest.mark.django_db
+
+
+@contextmanager
+def _no_deadline() -> Iterator[None]:
+    """Clear both deadline variables, then hand back whatever was there.
+
+    The tests below set them directly, outside any task. Left in place, the
+    values read as a live deadline to whichever test runs next in the same
+    context, which the default suite order happens to hide.
+    """
+    wall = _deadline.set(None)
+    mono = _deadline_monotonic.set(None)
+    try:
+        yield
+    finally:
+        _deadline_monotonic.reset(mono)
+        _deadline.reset(wall)
+
+
+@pytest.fixture(autouse=True)
+def _isolated_deadline() -> Iterator[None]:
+    with _no_deadline():
+        yield
 
 
 class _WallClockJumped:
@@ -60,3 +86,58 @@ class TestRemainingIsMeasuredOnTheEnforcersClock:
         _deadline_monotonic.set(None)
         assert remaining() is None
         assert deadline() is None
+
+
+class TestDeadlineIsolation:
+    """The isolation must restore what it found, not just clear it."""
+
+    @pytest.fixture
+    def incoming(self):
+        wall = timezone.now() + timezone.timedelta(seconds=90)
+        mono = time.monotonic() + 90
+        _deadline.set(wall)
+        _deadline_monotonic.set(mono)
+        return wall, mono
+
+    def test_clears_both_variables_inside(self, incoming):
+        with _no_deadline():
+            assert _deadline.get() is None
+            assert _deadline_monotonic.get() is None
+
+    def test_restores_incoming_values_afterwards(self, incoming):
+        with _no_deadline():
+            _deadline.set(timezone.now())
+            _deadline_monotonic.set(time.monotonic())
+        assert (_deadline.get(), _deadline_monotonic.get()) == incoming
+
+    def test_restores_incoming_values_when_the_body_fails(self, incoming):
+        with pytest.raises(AssertionError), _no_deadline():
+            _deadline.set(timezone.now())
+            _deadline_monotonic.set(time.monotonic())
+            raise AssertionError("a failing test")
+        assert (_deadline.get(), _deadline_monotonic.get()) == incoming
+
+
+@pytest.fixture(scope="class")
+def incoming_for_the_class() -> Iterator[tuple[datetime, float]]:
+    # Class scope sets these before the per-test fixture runs, and checks
+    # them after it has torn down for the last test in the class.
+    wall = timezone.now() + timezone.timedelta(seconds=90)
+    mono = time.monotonic() + 90
+    wall_token = _deadline.set(wall)
+    mono_token = _deadline_monotonic.set(mono)
+    yield wall, mono
+    found = (_deadline.get(), _deadline_monotonic.get())
+    _deadline_monotonic.reset(mono_token)
+    _deadline.reset(wall_token)
+    assert found == (wall, mono), "the fixture cleared the deadlines it found"
+
+
+@pytest.mark.usefixtures("incoming_for_the_class")
+class TestTheFixtureRestoresWhatItFound:
+    def test_a_test_starts_without_a_deadline(self):
+        assert (_deadline.get(), _deadline_monotonic.get()) == (None, None)
+
+    def test_values_a_test_sets_do_not_outlive_it(self):
+        _deadline.set(timezone.now())
+        _deadline_monotonic.set(time.monotonic())

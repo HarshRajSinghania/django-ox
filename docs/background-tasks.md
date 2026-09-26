@@ -471,23 +471,29 @@ Task id=0f68e1a7-17db-4f6f-87e5-6f05c6b3245e path=accounts.tasks.sync_to_crm sta
 Task id=0f68e1a7-17db-4f6f-87e5-6f05c6b3245e path=accounts.tasks.sync_to_crm state=SUCCESSFUL
 ```
 
-You did nothing to make this happen. A task that raises is retried with
-exponential backoff: three attempts by default, with the delay starting at
-five seconds and doubling each time, up to ten minutes. After the last
+This task needs no retry declaration. By default, a task that raises is
+retried with exponential backoff: three attempts, with the delay starting
+at five seconds and doubling each time, up to ten minutes. After the last
 failure the task is `FAILED` and stays in the table with the traceback of
 every attempt, where the admin's **Retry selected tasks** action can give
 it another go. In the admin, this task's detail page now shows `Attempt 1:
 builtins.ConnectionError` with its traceback under **Attempt errors**, and
 the return value beside it. `MAX_ATTEMPTS`, `BACKOFF_INITIAL` and
 `BACKOFF_MAX` on the [Configuration](configuration.md#options) page tune
-the envelope.
+the defaults.
+
+On Django 6.1 or Django 5.2 with django-tasks 0.12+, a task can instead
+declare its own `max_attempts`, `backoff` and `timeout`. The budget counts
+claims including the first; a backoff callback can choose a delay or stop
+retrying, and a timeout applies separately to each attempt. See
+[Per-task policy](configuration.md#per-task-policy).
 
 An attempt is counted when a worker claims the task, so a worker that dies
 mid-task uses one as well; after `LOCK_TIMEOUT` the reaper hands the task
-to another worker. Execution is at-least-once, so write tasks that are safe
-to run twice. [Common patterns](patterns.md#make-a-task-safe-to-run-twice)
-shows the shape, and [Production](production.md#the-reaper) has the
-mechanics.
+to another worker if its stored budget permits another claim. Execution
+is at-least-once, so write tasks that are safe to run twice.
+[Common patterns](patterns.md#make-a-task-safe-to-run-twice) shows the
+shape, and [Production](production.md#the-reaper) has the mechanics.
 
 ## Step 7: Add a recurring task, with no scheduler process
 
@@ -524,8 +530,8 @@ For a nightly report at three in the morning you would write
 in place of `cron`. Times are wall-clock in your `TIME_ZONE`, which is UTC
 in a fresh project.
 
-A schedule is validated before it can run. `manage.py check` reports a
-task path that does not import, or an expression that can never fire:
+`manage.py check` validates a schedule's declaration before it runs. It reports
+a task path that does not import, or an expression that can never fire:
 
 ```
 python manage.py check
@@ -548,10 +554,12 @@ ERRORS:
 System check identified 1 issue (0 silenced).
 ```
 
-The worker runs the same validation at startup, so a bad schedule stops a
-deploy rather than skipping in silence. Put `* * * * *` back and restart
-the worker. The startup line now says `schedules=1`, and at the next minute
-boundary the schedule fires:
+The worker runs the same validation at startup, so these errors stop startup
+rather than skipping dispatch in silence. The checks do not establish database
+acceptance of arguments; schedule-scoped failures at dispatch are logged as
+`schedule_dispatch_error`. Put `* * * * *` back and restart the worker.
+The startup line now says `schedules=1`, and at the next minute boundary
+the schedule fires:
 
 ```
 2026-09-19 07:59:12,044 INFO django_ox Worker myhost-23929-gJ7A6QmA starting: queues=['default'] concurrency=1 poll=1.0s schedules=1
@@ -602,10 +610,16 @@ in the admin without a deploy.
     restarted by the supervisor. Give the process manager a stop grace
     period longer than your slowest task, so a drain finishes before it
     escalates to SIGKILL.
-- **Probe with `ox_health`.** With no flags it checks that the database
-  answers, which is what a container health check should test. With
-  thresholds it turns queue depth and backlog age into an exit code for
-  cron alerting:
+- **Probe with `ox_health`.** For container loop-liveness, enable
+  `ox_worker --heartbeat-file PATH` and check it with
+  `ox_health --heartbeat-file PATH`, using the same `--processes N` on both
+  commands. Use an existing, writable directory private to the container.
+  A passing file probe means the expected controlling loops have advanced
+  recently, not that tasks are progressing.
+
+    With no flags, `ox_health` checks that the database answers. Keep that
+    dependency check separate from liveness restarts. Queue thresholds turn
+    queue depth and backlog age into an exit code for fleet alerting:
 
     ```
     python manage.py ox_health --max-backlog 100 --max-age 300
@@ -615,10 +629,11 @@ in the admin without a deploy.
     OK: backlog=0 oldest_age=none last_claim_age=37s
     ```
 
-    `--format json` prints the same figures as one object. Which check
-    belongs where is on the
-    [Monitoring](monitoring.md#health-checks-ox_health) page, with the
-    Prometheus endpoint and the log events.
+    `--format json` prints the result as one object. Which check belongs
+    where is on the
+    [Monitoring](monitoring.md#health-checks-ox_health) page, with startup
+    allowances, the hung-database restart tradeoff, the Prometheus endpoint
+    and the log events.
 - **Prune on a timer.** Finished rows stay in the table until you delete
   them, because the table is also the result store. Run `ox_prune` daily
   from cron or a systemd timer, with a retention that suits you. `--dry-run`

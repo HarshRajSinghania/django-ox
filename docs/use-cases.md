@@ -59,7 +59,7 @@ build_report.enqueue(account_id=42)
 With Django's PostgreSQL pool, check
 [pool sizing](production.md#database-connections-and-postgresql-pooling).
 
-Failed tasks retry with exponential backoff up to `MAX_ATTEMPTS`. When a job needs attention, open Django admin to inspect each attempt's traceback. You supervise a worker process, but there is no second datastore to provision or monitor. The queue uses your database's capacity.
+Failed tasks retry with exponential backoff by default, subject to the stored claim budget selected at enqueue from the task's `max_attempts` or the backend's `MAX_ATTEMPTS`. A task backoff callback can choose a delay from zero to about a thousand years, independently of `BACKOFF_MAX`, or stop retries by returning `None`. When a job needs attention, open Django admin to inspect each attempt's traceback. You supervise a worker process, but there is no second datastore to provision or monitor. The queue uses your database's capacity.
 
 ## Enqueue a task inside transaction.atomic()
 
@@ -110,7 +110,7 @@ Every worker dispatches due schedules. A unique constraint on the schedule name 
 
 Keep schedules in settings, or let your team pause and edit them as [rows in Django admin](stored-schedules.md). See [Recurring tasks](recurring-tasks.md) for the configuration.
 
-Schedules run while at least one worker is running. After an outage, only the most recent missed tick is enqueued.
+Schedules need at least one running worker and a usable database. A schedule-scoped failure does not stop later entries if rollback succeeds and the same connection remains usable. After an outage, only the most recent missed tick is enqueued.
 
 ## Deduplicate a repeated webhook with Oxpull Pro
 

@@ -44,7 +44,9 @@ On Django 6.0+, use `from django.tasks import task`. On Django 5.2 LTS, use `fro
 
 ## Keep the work when a worker dies
 
-Workers claim tasks with `SELECT ... FOR UPDATE SKIP LOCKED` on PostgreSQL and MySQL 8+, or an atomic compare-and-set UPDATE on SQLite. A reaper returns unfinished tasks to the queue when their worker dies. Failed tasks retry with exponential backoff up to `MAX_ATTEMPTS`, with every attempt's traceback kept.
+Workers claim tasks with `SELECT ... FOR UPDATE SKIP LOCKED` on PostgreSQL and MySQL 8+, or an atomic compare-and-set UPDATE on SQLite. A reaper returns unfinished tasks to the queue when their worker dies, subject to their stored attempt budgets. Failed tasks retry with exponential backoff by default, with every attempt's traceback kept.
+
+On Django 6.1 or Django 5.2 with django-tasks 0.12+, each task can declare its own `max_attempts`, `backoff` callback and `timeout`. The budget counts claims including the first; backend settings supply the defaults. See [Per-task policy](https://oxpull.com/django-ox/configuration/#per-task-policy).
 
 Execution is at-least-once: make tasks safe to repeat.
 
@@ -52,11 +54,11 @@ Enqueue inside `transaction.atomic()` on the database holding `OxTask`, and the 
 
 Inspect attempts and retry or discard tasks in Django admin. Open **Queue overview** from the task change list to compare queues. Edit recurring schedules in admin or declare them in settings; workers dispatch them without a scheduler process.
 
-For deployment probes, `ox_health` turns queue thresholds into an exit code, with `--format json` for structured output. Monitor through `django_ox.stats` or `/ox/metrics`, and clear finished rows with `ox_prune`. Use `--database` on `ox_worker`, `ox_prune` and `ox_health` to select the database alias.
+For fleet alerting, `ox_health` turns queue thresholds into an exit code. For local loop-liveness probes, pair `ox_worker --heartbeat-file PATH` with `ox_health --heartbeat-file PATH`, using the same process count. Both health modes support `--format json`. Monitor through `django_ox.stats` or `/ox/metrics`, and clear finished rows with `ox_prune`. Use `--database` on `ox_worker`, `ox_prune` and the database mode of `ox_health` to select the database alias.
 
 In the [published benchmarks](https://oxpull.com/django-ox/benchmarks/), 2,000 of 2,000 tasks finished after 20 worker kills per trial, queue drain was up to 20% faster than django-tasks-db, and enqueueing 10,000 tasks took 0.71 s.
 
-1,086 test functions, with CI covering Python 3.12 to 3.14, Django 5.2 to 6.1, PostgreSQL, MySQL and SQLite. Open source under the BSD 3-Clause licence.
+CI covers Python 3.12 to 3.14, Django 5.2 to 6.1, PostgreSQL, MySQL and SQLite. Open source under the BSD 3-Clause licence.
 
 Need to coordinate work across tasks? [Oxpull Pro](https://oxpull.com/) adds batches, unique tasks, rate limiting and workflows.
 
@@ -112,7 +114,7 @@ each carrying a link and the date it was read on the
 | Broker to run | **None.** The queue is a table in the database you already run | **None.** Django ORM | RabbitMQ, Redis or SQS | Redis, SQLite, PostgreSQL, file or memory |
 | Transactional enqueue | **Yes.** Enqueue is one INSERT on your default database; a task written inside `atomic()` commits or rolls back with the rows beside it | Not claimed | **No.** Django's own docs name this as the case for `on_commit()` | Not claimed |
 | Worker killed mid-task | **Retried.** The lease expires and the task goes back on the queue | **Stuck.** The task stays `PROCESSING`, never retried and never failed. Open since 2024-06-11 | **Lost** when the child process is killed, even with `acks_late` | **Lost.** "will not be retried automatically" |
-| Retries and backoff | **Exponential**, keeping every attempt's traceback | **None** | Yes | Yes |
+| Retries and backoff | **Exponential by default**, keeping every attempt's traceback. Per-task budget and backoff on Django 6.1 or Django 5.2 with django-tasks 0.12+ | **None** | Yes | Yes |
 | Recurring schedules | **Cron or a fixed interval, and no scheduler process.** Editable in the Django admin, limited to the tasks your code exposes | **None** | `celery beat`, a separate process you must run exactly one of | Yes |
 
 The full version has six more backends, a footnote and a date on every cell,
@@ -170,13 +172,16 @@ python manage.py ox_worker
 | `--interval` | `1.0` | Polling interval in seconds when idle. |
 | `--lock-timeout` | backend `LOCK_TIMEOUT` | Seconds a RUNNING task's lock may go unrefreshed before the task is reclaimed. |
 | `--database` | the alias `OxTask` writes to | Database alias to run against. Every `--processes` child is given the same one. It is not checked against the router. |
-| `--batch` | off | Exit once a poll pass finds nothing to claim and none of its own tasks is running. For cron and job runners. Single process only. |
+| `--heartbeat-file PATH` | off | Update a local file at the head of every poll and drain pass. Above one process, write `PATH.supervisor` and `PATH.i` for each slot, not `PATH`. Requires an existing, writable directory private to the container. See [heartbeat liveness](https://oxpull.com/django-ox/monitoring/#local-heartbeat-files). |
+| `--batch` | off | Exit once an error-free poll pass finds nothing to claim and began with none of its own tasks in flight. Schedule-scoped failures do not hold a batch open. For cron and job runners. Single process only. |
 | `--max-tasks N` | none | Exit after claiming N task attempts, failed attempts and retries included. Single process only. |
 
-On SIGTERM or SIGINT the worker stops claiming, finishes in-flight tasks, then
-exits. A second signal forces an immediate exit. With `--processes` above 1,
-send the signal to the supervisor; it forwards once and restarts a worker that
-dies.
+On SIGTERM or SIGINT the worker requests a stop to claiming, drains
+in-flight tasks after its current poll pass returns, then exits. A second
+signal forces an immediate exit. A wedged database call can prevent the
+drain from starting and require a second signal or SIGKILL. With
+`--processes` above 1, send the signal to the supervisor; it forwards once
+and restarts a worker that dies.
 
 ## Pruning
 
@@ -208,21 +213,36 @@ not narrow that.
 
 `django_ox.stats` exposes queue metrics as plain functions, each a single
 ORM query: per-queue status counts, backlog depth and age, throughput,
-and failure rate. The `ox_health` command turns thresholds on those
-numbers into an exit code for cron alerting and container probes:
+and failure rate. The database mode of `ox_health` turns thresholds on
+those numbers into an exit code for fleet alerting:
 
 ```
 python manage.py ox_health --max-backlog 1000 --max-age 600
 ```
 
+For local controlling-loop liveness, enable `ox_worker --heartbeat-file PATH`
+and run `ox_health --heartbeat-file PATH` with the same `--processes N`.
+This mode checks file metadata without querying the database.
+
 | Flag | Default | Meaning |
 | --- | --- | --- |
-| `--queue` | all queues | Restrict the checks to one queue. |
-| `--format` | `text` | `json` prints one object on stdout instead of the `OK:` line: `ok`, `queue`, `backlog`, `oldest_age_seconds`, `last_claim_age_seconds` and `problems`. `queue` is `null` when no `--queue` is given. The figures are `null` when there is nothing to measure or the check could not run, as with an unreachable database or an invalid threshold. The object is printed on failure too, before the same non-zero exit. |
+| `--queue` | all queues | Restrict the database checks to one queue. |
+| `--format` | `text` | `json` prints one object on stdout instead of the `OK:` line, on success and failure. Database mode includes `ok`, `queue`, `backlog`, `oldest_age_seconds`, `last_claim_age_seconds` and `problems`. `queue` is `null` when no queue is selected; figures are `null` when there is nothing to measure or the check cannot run. File mode includes `ok`, `heartbeat_file`, `processes`, `max_heartbeat_age_seconds`, `files` and `problems`. See the [JSON reference](https://oxpull.com/django-ox/monitoring/#file-mode-json). |
 | `--max-backlog` | off | Fail when more than this many READY tasks are eligible to run. |
 | `--max-age` | off | Fail when a READY task has been eligible to run for longer than this. Accepts `7d`, `24h`, `90m`, `45s`, or a plain number of seconds. |
-| `--worker-timeout` | off | Fail when no worker has claimed a task within this long. Accepts `7d`, `24h`, `90m`, `45s`, or a plain number of seconds. |
+| `--worker-timeout` | off | Fail when no worker has claimed a task within this long, or no claim was ever recorded. Accepts `7d`, `24h`, `90m`, `45s`, or a plain number of seconds. Measures fleet claim activity, not one worker's liveness. |
 | `--database` | the alias `OxTask` writes to | Database alias to check. The figures come from that alias, so the check reports the queue your workers are running. |
+| `--heartbeat-file PATH` | off | Check the worker's local heartbeat files instead of the database. Cannot be combined with database or queue health options. |
+| `--max-heartbeat-age SECONDS` | `60` | Maximum file age, inclusive. Accepts duration suffixes or seconds, including fractions; must be finite and positive. Requires `--heartbeat-file`. |
+| `--processes N` | `1` | Expected worker process count. At 1, check `PATH`; above 1, require `PATH.supervisor` and every slot file from `PATH.0` through `PATH.(N-1)` to pass. Requires `--heartbeat-file`. |
+
+A passing file probe means the expected controlling loops have advanced
+recently, not that tasks are progressing. A hung database can make every
+file stale and trigger fleet-wide liveness restarts. Use an existing,
+writable directory private to the container, allow for startup and slot
+replacement, and keep project Django startup database-free. See the
+[probe guidance](https://oxpull.com/django-ox/monitoring/#health-checks-ox_health)
+before enabling automatic restarts.
 
 Mounting `path("ox/", include("django_ox.urls"))` exposes `GET /ox/metrics`,
 the same numbers as Prometheus gauges; the view has no authentication of its
@@ -292,7 +312,7 @@ once however many workers are polling. Execution stays at-least-once.
 | `cron` | one of | Five-field cron expression. |
 | `every` | one of | A fixed interval, as a `timedelta` or seconds, counted from a fixed instant rather than from the last run. |
 | `phase` | no | Shifts an `every` sequence. |
-| `args`, `kwargs` | no | JSON-serializable arguments passed to each enqueue. |
+| `args`, `kwargs` | no | JSON-serializable arguments passed to each enqueue. The database must also accept the values; serialization alone does not establish that. |
 | `queue_name` | no | Queue override; defaults to the task's own queue. |
 | `priority` | no | Priority override (-100 to 100). |
 
@@ -303,9 +323,12 @@ shortcuts. When both day-of-month and day-of-week are restricted, a day
 matches if either field does, as in vixie cron. Times are wall-clock in
 your `TIME_ZONE`.
 
-Misconfigured schedules (a task path that does not import, an expression
-that can never fire) fail at worker startup and in `manage.py check`, not
-silently at dispatch time.
+A task path that does not import or an expression that can never fire fails
+at worker startup and in `manage.py check`. These checks do not establish
+database acceptance: a value such as `float("inf")` passes them but is
+rejected at enqueue by PostgreSQL, MySQL and SQLite. A schedule-scoped
+failure is logged as `schedule_dispatch_error`. After rollback, the worker
+continues to later schedules if the same database connection remains usable.
 
 Missed ticks: if every worker was down when a tick passed, the latest
 missed tick fires once on recovery and older ones are skipped, so a
@@ -339,19 +362,22 @@ path, so admin access does not become permission to run anything. See
 ## Scope
 
 The core is finite on purpose: a durable queue, a worker, recurring
-schedules, monitoring, and nothing else to operate. Outside the current
-scope: interrupting one chosen running task on demand (every attempt can be
-bounded with `TASK_TIMEOUT`).
+schedules, monitoring, and nothing else to operate. Interrupting one chosen
+running task on demand is outside the current scope. Attempt deadlines can
+be set with `TASK_TIMEOUT`, per queue with `TASK_TIMEOUTS`, or per task
+with `timeout` on Django 6.1 or Django 5.2 with django-tasks 0.12+.
+See [Task timeouts](https://oxpull.com/django-ox/production/#task-timeouts)
+for enforcement and its limits.
 
 django-ox keeps all its own tables on one database, the one your router
-sends `OxTask` to. `django_ox.E008` reports a router that splits them.
-Under a router that sends reads to a replica, django-ox reads its own rows
-on the alias it writes them to. The admin has no way out of that: every
-page reads the primary, and no setting changes it. `ox_worker`, `ox_prune`
-and `ox_health` take `--database` to name the alias django-ox works on. It
-defaults to the alias `OxTask` writes to, `default` unless you wrote a
-router. The flag is not checked against the router: a worker pointed at
-another alias works there and nothing warns, so leave it unset unless you
+sends `OxTask` to. `django_ox.E008` reports a router that splits them. Under
+a router that sends reads to a replica, django-ox reads its own rows on the
+alias it writes them to. The admin has no way out of that: every page reads
+the primary, and no setting changes it. `ox_worker`, `ox_prune` and the
+database mode of `ox_health` take `--database` to name the alias django-ox
+works on. It defaults to the alias `OxTask` writes to, `default` unless you
+wrote a router. The flag is not checked against the router: a worker pointed
+at another alias works there and nothing warns, so leave it unset unless you
 mean it. See
 [Read replicas](https://oxpull.com/django-ox/configuration/#read-replicas).
 

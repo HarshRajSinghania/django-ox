@@ -2,6 +2,7 @@ import asyncio
 import copy
 import ctypes
 import functools
+import inspect
 import json
 import logging
 import math
@@ -14,7 +15,15 @@ import time
 import uuid
 from collections.abc import Callable, Coroutine, Generator, Iterator, Mapping
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
-from contextlib import ExitStack, closing, contextmanager, suppress
+from contextlib import (
+    AbstractContextManager,
+    ExitStack,
+    closing,
+    contextmanager,
+    nullcontext,
+    suppress,
+)
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from inspect import iscoroutinefunction
@@ -29,13 +38,22 @@ from django.db import (
     DatabaseError,
     Error,
     IntegrityError,
+    InterfaceError,
     OperationalError,
     close_old_connections,
     connections,
     router,
     transaction,
 )
-from django.db.models import DateTimeField, ExpressionWrapper, F, Max, Q, QuerySet
+from django.db.models import (
+    DateTimeField,
+    ExpressionWrapper,
+    F,
+    JSONField,
+    Max,
+    Q,
+    QuerySet,
+)
 from django.db.models.expressions import Combinable, CombinedExpression
 from django.db.models.functions import Now
 from django.utils import timezone
@@ -55,6 +73,7 @@ from django_ox.compat import (
 
 from .backend import OxBackend
 from .exceptions import TaskAbandoned, TaskTimeout
+from .heartbeat import HeartbeatFile
 from .models import OxScheduleTick, OxTask
 from .schedules import (
     Schedule,
@@ -62,10 +81,13 @@ from .schedules import (
     schedule_name_collisions,
     schedule_source_from_options,
 )
+from .tasks import BackoffCallback, task_policy
 from .timeouts import (
+    MAX_SECONDS,
     RECYCLE_EXIT_CODE,
     _deadline,
     _deadline_monotonic,
+    _seconds,
     task_timeouts_from_options,
 )
 
@@ -110,6 +132,19 @@ LIBPQ_MIN_CONNECT_TIMEOUT = 2
 # While lease renewal can get no connection at all, it says so at most this
 # often, with the number of renewals missed since it last did.
 MISSED_RENEWAL_REPORT_INTERVAL = 30.0
+
+# While one schedule keeps failing to dispatch, or dispatch passes keep being
+# abandoned, the worker says so with a traceback the first time and after
+# that at most this often, with the number of failures since it last did.
+DISPATCH_FAILURE_REPORT_INTERVAL = 60.0
+
+# The task path of the attempt Worker.execute() is running in this context, or
+# None outside one. django_ox.testing.run_tasks() reads it to refuse a drain
+# started from inside a task. A context variable rather than a thread-local or
+# an attribute of the worker: an async task's coroutine runs where asgiref
+# puts it, with the caller's context copied across, and a task can reach code
+# that builds a worker of its own.
+_executing: ContextVar[str | None] = ContextVar("django_ox_executing", default=None)
 
 
 def _load_async_exc_injector() -> Callable[[int], None] | None:
@@ -254,6 +289,209 @@ def _latch_instant() -> datetime:
     return instant.replace(tzinfo=UTC) if settings.USE_TZ else instant
 
 
+def _lost_the_race(exc: IntegrityError) -> bool:
+    """
+    Is this the tick INSERT refused by the unique constraint, and nothing else?
+
+    Asked only of an IntegrityError raised before this pass's tick row is
+    in, where the tick INSERT is the only statement that can meet a unique
+    constraint. Losing the race for a tick is a duplicate key and nothing
+    else: PostgreSQL's unique_violation (23505), MySQL's duplicate entry
+    (1062, or 1586 where the message names the key), SQLite's UNIQUE
+    constraint message, Oracle's ORA-00001. Any other integrity failure on
+    the INSERT is a fault, and read as a lost race it would be retried
+    silently forever.
+    """
+    cause = exc.__cause__
+    # Not "any SQLSTATE but 23505 is something else": PyMySQL sets one too,
+    # the class-wide 23000 that every MySQL integrity error shares.
+    sqlstate = getattr(cause, "sqlstate", None) or getattr(cause, "pgcode", None)
+    if sqlstate == "23505":
+        return True
+    if exc.args and exc.args[0] in (1062, 1586):
+        return True
+    message = str(exc)
+    return "UNIQUE constraint failed" in message or "ORA-00001" in message
+
+
+@dataclass(slots=True)
+class _Failing:
+    """One run of consecutive dispatch failures, as _DispatchReport counts it."""
+
+    #: Failures in this run, the first included.
+    failures: int
+    #: Failures since the last line about them.
+    unreported: int
+    #: When the last line was written, on the report's clock.
+    reported_at: float
+
+
+class _DispatchReport:
+    """
+    What a worker logs about schedule dispatch failing: once in full, then
+    in summary, then once when it recovers.
+
+    Execution is not throttled, only the reporting. A schedule the database
+    rejects is tried again on every dispatch pass, about once a second, and
+    fails the same way each time; a traceback per attempt is some 6 KB per
+    worker per second of byte-identical text, enough to crowd out every
+    other report in the log.
+
+    Per schedule, keyed on this worker, its database alias and the
+    schedule's dispatch key, which for a stored row is its primary key and
+    survives a rename. The first failure is `schedule_dispatch_error` at
+    ERROR with the traceback. Later ones are counted, and at most every
+    DISPATCH_FAILURE_REPORT_INTERVAL seconds the same event is logged again
+    without a traceback, carrying how many were suppressed and the class of
+    the latest. The next successful dispatch of that schedule on this worker
+    is one `schedule_dispatch_recovered` line with the total. No event
+    carries the schedule's arguments, which are what the database refused
+    and can be anything a person typed; only the first traceback carries
+    the database's own message, which on PostgreSQL can quote part of the
+    refused value.
+
+    Per pass, the same shape for `schedule_dispatch_failed`: the first
+    abandoned pass of an outage is reported with its traceback, and the
+    passes after it are counted into a summary at most every interval. A
+    completed pass ends the run, so the next outage is reported in full.
+
+    The state is bounded by the schedules that exist: `retain` forgets a
+    schedule that is no longer among them. A stored row that is paused
+    still exists, so a run of failures outlives the pause: resumed and
+    still refused, it goes on counting without a second first report;
+    repaired while paused, its next dispatch is the recovery. A deleted
+    row is forgotten without an event, and so is a schedule that any
+    other source stops answering, since only the stored source can say
+    what exists beyond its answer. `clock` is time.monotonic outside
+    tests.
+    """
+
+    def __init__(
+        self,
+        worker_id: str,
+        db_alias: str,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self.worker_id = worker_id
+        self.db_alias = db_alias
+        self.clock = clock
+        self._schedules: dict[str, _Failing] = {}
+        self._passes: _Failing | None = None
+
+    def retain(self, keys: set[str]) -> None:
+        """Forget every failing schedule whose key is not in `keys`."""
+        for key in [k for k in self._schedules if k not in keys]:
+            del self._schedules[key]
+
+    def schedule_failed(self, schedule: Schedule, exc: BaseException) -> None:
+        """One schedule's dispatch failed and the pass goes on without it."""
+        now = self.clock()
+        state = self._schedules.get(schedule.key)
+        # Each record's extra is a literal dict, so the docs test's scan of
+        # emitted keys can read every key it carries.
+        if state is None:
+            self._schedules[schedule.key] = _Failing(1, 0, now)
+            logger.error(
+                "Schedule %s could not be dispatched this pass",
+                schedule.name,
+                exc_info=exc,
+                extra={
+                    "event": "schedule_dispatch_error",
+                    "schedule": schedule.name,
+                    "worker_id": self.worker_id,
+                    "database": self.db_alias,
+                    "error": type(exc).__name__,
+                    "failures": 1,
+                    "suppressed": 0,
+                },
+            )
+            return
+        state.failures += 1
+        state.unreported += 1
+        if now - state.reported_at < DISPATCH_FAILURE_REPORT_INTERVAL:
+            return
+        logger.error(
+            "Schedule %s still cannot be dispatched: %d more failure(s) since "
+            "it was last reported, latest error %s",
+            schedule.name,
+            state.unreported,
+            type(exc).__name__,
+            extra={
+                "event": "schedule_dispatch_error",
+                "schedule": schedule.name,
+                "worker_id": self.worker_id,
+                "database": self.db_alias,
+                "error": type(exc).__name__,
+                "failures": state.failures,
+                "suppressed": state.unreported,
+            },
+        )
+        state.reported_at = now
+        state.unreported = 0
+
+    def schedule_dispatched(self, schedule: Schedule) -> None:
+        """A schedule's tick committed; if it had been failing, say it is back."""
+        state = self._schedules.pop(schedule.key, None)
+        if state is None:
+            return
+        logger.info(
+            "Schedule %s dispatched again after %d failed attempt(s)",
+            schedule.name,
+            state.failures,
+            extra={
+                "event": "schedule_dispatch_recovered",
+                "schedule": schedule.name,
+                "worker_id": self.worker_id,
+                "database": self.db_alias,
+                "failures": state.failures,
+            },
+        )
+
+    def pass_failed(self, exc: BaseException) -> None:
+        """A dispatch pass was abandoned."""
+        now = self.clock()
+        state = self._passes
+        if state is None:
+            self._passes = _Failing(1, 0, now)
+            logger.warning(
+                "Schedule dispatch failed; retrying next pass",
+                exc_info=exc,
+                extra={
+                    "event": "schedule_dispatch_failed",
+                    "worker_id": self.worker_id,
+                    "database": self.db_alias,
+                    "error": type(exc).__name__,
+                    "failures": 1,
+                    "suppressed": 0,
+                },
+            )
+            return
+        state.failures += 1
+        state.unreported += 1
+        if now - state.reported_at < DISPATCH_FAILURE_REPORT_INTERVAL:
+            return
+        logger.warning(
+            "Schedule dispatch still failing: %d more pass(es) abandoned since "
+            "the last report, latest error %s",
+            state.unreported,
+            type(exc).__name__,
+            extra={
+                "event": "schedule_dispatch_failed",
+                "worker_id": self.worker_id,
+                "database": self.db_alias,
+                "error": type(exc).__name__,
+                "failures": state.failures,
+                "suppressed": state.unreported,
+            },
+        )
+        state.reported_at = now
+        state.unreported = 0
+
+    def pass_completed(self) -> None:
+        """A dispatch pass went through every schedule it had."""
+        self._passes = None
+
+
 @dataclass(slots=True)
 class _Watch:
     """One attempt under a timeout, as the watchdog sees it."""
@@ -276,6 +514,165 @@ class _Watch:
     tracer: str | None = None
     fired: bool = False
     grace_at: float = 0.0
+
+
+@dataclass(slots=True, frozen=True)
+class _CallerTransaction:
+    """
+    A connection that was already inside an atomic block when an attempt
+    started, and the depth it was at then: Django's stack of open blocks
+    and of their savepoints, as the caller left them.
+
+    Inline, that block is the caller's: run_once() inside their atomic(),
+    or inside a TestCase. The attempt did not open it and a timeout must
+    not end it. See _discard_connections.
+    """
+
+    connection: Any
+    atomic_blocks: tuple[Any, ...]
+    savepoint_ids: tuple[str | None, ...]
+
+
+def _caller_transactions() -> tuple[_CallerTransaction, ...]:
+    """
+    This thread's connections that are inside an atomic block now, each at
+    its current depth. Taken as an attempt starts: on a worker's own thread
+    there are none, and inline they are the caller's.
+    """
+    return tuple(
+        _CallerTransaction(
+            connection=conn,
+            atomic_blocks=tuple(conn.atomic_blocks),
+            savepoint_ids=tuple(conn.savepoint_ids),
+        )
+        for conn in connections.all(initialized_only=True)
+        if conn.in_atomic_block
+    )
+
+
+def _restore_caller_transaction(conn: Any, caller: _CallerTransaction) -> None:
+    """
+    Put `conn` back at the depth its caller's atomic block had when the
+    attempt started, after a TaskTimeout, and leave the caller's
+    transaction itself alone.
+
+    A delivery inside the task's own atomic() entry or exit can leave the
+    block the task opened on Django's stacks, with its savepoint still
+    open. That block belongs to the attempt: its savepoint is rolled back
+    and released, and its entries come off the stacks, so the caller's own
+    exit finds the entries it pushed and commits or rolls back what it
+    would have. Nothing else is touched. The connection is not closed, and
+    no flag is cleared: rollback state that an error left is the caller's
+    to act on.
+
+    The caller's transaction is marked for rollback only when the
+    attempt's levels cannot be undone apart from the caller's: the first
+    of them has no savepoint, the rollback to it fails, the connection is
+    already marked or closed, or the stacks no longer begin with the
+    caller's own entries. Django's own exit marks a failed block without a
+    savepoint the same way. The outcome write that follows is then
+    refused, and run_once() raises that to its caller rather than record
+    the attempt outside the caller's transaction.
+    """
+    if not conn.in_atomic_block:
+        # The caller's block is gone, which only the task can have done;
+        # there is nothing of the caller's left to put back.
+        return
+    depth = len(caller.atomic_blocks)
+    marks = len(caller.savepoint_ids)
+    if (
+        len(conn.atomic_blocks) < depth
+        or len(conn.savepoint_ids) < marks
+        or any(
+            ours is not theirs
+            for ours, theirs in zip(
+                conn.atomic_blocks[:depth], caller.atomic_blocks, strict=True
+            )
+        )
+        or tuple(conn.savepoint_ids[:marks]) != caller.savepoint_ids
+    ):
+        conn.needs_rollback = True
+        return
+    opened = conn.savepoint_ids[marks:]
+    if len(conn.atomic_blocks) == depth and not opened:
+        # Django's exit ran for every block the task opened, which is the
+        # usual case: the delivery landed in the task's own code.
+        return
+    del conn.atomic_blocks[depth:]
+    del conn.savepoint_ids[marks:]
+    sid = opened[0] if opened else None
+    if sid is None or conn.needs_rollback or conn.closed_in_transaction:
+        conn.needs_rollback = True
+        return
+    try:
+        conn.savepoint_rollback(sid)
+        conn.savepoint_commit(sid)
+    except Error:
+        conn.needs_rollback = True
+
+
+@dataclass(slots=True, frozen=True)
+class _AttemptPolicy:
+    """
+    The policy one attempt runs under, as _run_attempt resolved it.
+
+    Held on the attempt's own thread for _handle_failure, which takes no
+    task and whose signature is a contract subclasses and callers rely on.
+    Keyed by the attempt, so a failure recorded for any other row or epoch
+    on this thread, or for this one from another thread, finds nothing and
+    takes the worker's backoff.
+
+    Registered before the rebuild as well as after it. ``task`` None is an
+    attempt that failed before it had a task: the path no longer imports,
+    the module raised while importing, or the declaration was refused. That
+    is what tells _handle_failure not to import the task a second time,
+    which finding no policy at all, the case of a caller outside any
+    attempt, cannot.
+    """
+
+    attempt: tuple[Any, int]
+    task: "Task[..., Any] | None"
+    backoff: BackoffCallback | None
+    #: run_once() on the caller's own thread, where an interrupt from a
+    #: backoff callback belongs to the caller, as one from the task does.
+    inline: bool
+    #: The connections that were inside an atomic block when the attempt
+    #: started, which _discard_connections leaves to their caller.
+    caller_transactions: tuple[_CallerTransaction, ...] = ()
+
+
+def _backoff_seconds(
+    override: Any, options: Mapping[str, Any], name: str, default: float
+) -> float:
+    """
+    The worker's effective BACKOFF_INITIAL or BACKOFF_MAX, validated.
+
+    From OPTIONS it is held to what django_ox.E010 holds it to, so a worker
+    started with --skip-checks refuses what `manage.py check` would have.
+    A constructor override may also be zero: backoff_initial=0 is how tests
+    and embedding code have always asked for retries with no wait, and it is
+    a valid instruction rather than a slip. Negative, not finite, above a
+    thousand years, a bool or not a number is refused either way; the delay
+    is added to a datetime on the failure path, where raising would leave
+    the row RUNNING for the reaper.
+    """
+    if override is None:
+        # A float: unlimited=False refuses None.
+        return cast(
+            "float",
+            _seconds(options.get(name, default), f"OPTIONS[{name!r}]", unlimited=False),
+        )
+    if (
+        isinstance(override, bool)
+        or not isinstance(override, (int, float))
+        or math.isnan(override)
+        or not 0 <= override <= MAX_SECONDS
+    ):
+        raise ImproperlyConfigured(
+            f"{name.lower()} must be a number of seconds from 0 to "
+            f"{MAX_SECONDS:.0f}, got {override!r}."
+        )
+    return float(override)
 
 
 # The states an execution may write its outcome onto. RUNNING is the ordinary
@@ -464,6 +861,71 @@ def _pool_options(alias: str) -> Mapping[str, Any] | None:
     if isinstance(pool, Mapping) and pool:
         return pool
     return None
+
+
+def _connection_pool(conn: Any) -> Any:
+    """
+    The open psycopg_pool pool Django checks `conn`'s alias out of, or None
+    when the alias is not pooled or its pool is not open. A pool that
+    nothing has connected through yet, or that was closed, holds no
+    connection to test, and checking it would ask a pool with no workers
+    to grow.
+    """
+    if conn.vendor != "postgresql" or _pool_options(conn.alias) is None:
+        return None
+    pool = getattr(conn, "pool", None)
+    if pool is None or pool.closed:
+        return None
+    return pool
+
+
+def _sweep_pool(conn: Any) -> None:
+    """
+    Have Django's PostgreSQL pool for `conn`'s alias test every connection
+    it holds idle, now, and discard each that fails; nothing when the alias
+    is not pooled.
+
+    A connection lost to a restart or a failover is rarely the only one:
+    the server ended every session, and the pool's idle connections are as
+    dead as the one that just failed. Closing that one hands it back for
+    the pool to discard, but the next statement on this thread checks out
+    one of the others. Without CONN_HEALTH_CHECKS the pool hands it out
+    unchecked, and it fails at its first statement too; with them, the
+    checkout tests it, discards it and tries the next, waiting longer each
+    time, and enough dead ones use up the checkout's timeout. psycopg_pool's
+    check() takes every idle connection out, tests each once, puts the
+    live ones back and asks for a replacement of each dead one.
+
+    It costs one round trip per idle connection, and a dead one can take
+    longer to fail than a live one takes to answer, so it runs only on a
+    path that has already failed, never on an ordinary one. It does not
+    make the next checkout fresh: a replacement may still be connecting,
+    and the checkout waits for it; the database may still be down; and a
+    connection the sweep found alive can drop the moment after.
+
+    Best-effort: it runs while the caller handles an error, and whatever it
+    raises is dropped, so it can neither replace that error nor stop the
+    recovery that follows.
+    """
+    with suppress(Exception):
+        pool = _connection_pool(conn)
+        if pool is not None:
+            pool.check()
+
+
+def _close_lost_connection(conn: Any) -> None:
+    """
+    Close `conn`, which a lost connection to its database has left unusable,
+    then sweep its pool, _sweep_pool, when the alias is pooled.
+
+    Only for a connection outside any atomic block, which each caller
+    checks first: inside one, the transaction belongs to whoever opened the
+    block, not to the worker. close() drops its reference to the driver
+    connection even when closing it raises, and on a dead one it may.
+    """
+    with suppress(Error):
+        conn.close()
+    _sweep_pool(conn)
 
 
 def _reason(exc: BaseException) -> str:
@@ -957,6 +1419,7 @@ class Worker:
         db_alias: str | None = None,
         batch: bool = False,
         max_tasks: int | None = None,
+        heartbeat_file: str | None = None,
     ) -> None:
         backend = task_backends[backend_alias]
         if not isinstance(backend, OxBackend):
@@ -966,6 +1429,11 @@ class Worker:
             )
         self.backend = backend
         options = backend.options
+        # The budget a row gets when its task declares none. Read for its
+        # validation: a worker started with --skip-checks, or built by code
+        # that never runs checks, refuses an invalid MAX_ATTEMPTS here, the
+        # way it refuses an invalid timeout, instead of enqueueing with it.
+        _ = backend.max_attempts
         # Empty means the backend accepts any queue name; the worker then
         # processes all queues rather than filtering.
         self.queues: list[str] = list(queues) if queues else sorted(backend.queues)
@@ -1059,20 +1527,20 @@ class Worker:
                 f"{backend_alias!r} and {other_alias!r} backends; schedule "
                 "names must be unique across backends."
             )
-        self.backoff_initial: float = (
-            backoff_initial
-            if backoff_initial is not None
-            else float(options.get("BACKOFF_INITIAL", 5.0))
+        # The retry delay for every failure a task's own backoff does not
+        # decide: tasks that declare none, a backoff that raised or answered
+        # something unusable, and attempts that never reached the task.
+        self.backoff_initial: float = _backoff_seconds(
+            backoff_initial, options, "BACKOFF_INITIAL", 5.0
         )
-        self.backoff_max: float = (
-            backoff_max
-            if backoff_max is not None
-            else float(options.get("BACKOFF_MAX", 600.0))
+        self.backoff_max: float = _backoff_seconds(
+            backoff_max, options, "BACKOFF_MAX", 600.0
         )
         # TASK_TIMEOUT, the per-queue TASK_TIMEOUTS and TASK_TIMEOUT_GRACE,
         # validated the same way the system check validates them. The
         # keywords override the default and the grace; per-queue values
-        # still come from the options.
+        # still come from the options. A task's own timeout wins over both
+        # for its attempts; see TaskTimeouts.for_attempt.
         if task_timeout is not None:
             options = {**options, "TASK_TIMEOUT": task_timeout}
         if task_timeout_grace is not None:
@@ -1086,6 +1554,17 @@ class Worker:
         self.worker_id = (
             f"{socket.gethostname()[:40]}-{os.getpid()}-{get_random_string(8)}{suffix}"
         )
+        # Updated at the head of every poll and drain pass and before each
+        # claim, and nowhere else; django_ox.heartbeat says what a fresh file
+        # does and does not prove.
+        # The path is this process's own: ox_worker adds the slot suffix
+        # under a supervisor before it gets here.
+        self.heartbeat_file = heartbeat_file
+        self._heartbeat = (
+            HeartbeatFile(heartbeat_file, owner=f"Worker {self.worker_id}")
+            if heartbeat_file
+            else None
+        )
         self._stop = Event()
         # Resolved once, here, and every statement this worker runs goes to
         # it. ox_worker --database sets it; otherwise it is the alias the
@@ -1093,6 +1572,8 @@ class Worker:
         self._db_alias = (
             db_alias if db_alias is not None else router.db_for_write(OxTask)
         )
+        #: Rate-limits what dispatch failures log; _DispatchReport says how.
+        self._dispatch_report = _DispatchReport(self.worker_id, self._db_alias)
         # (pk, lease_epoch) of every execution running right now, added and
         # removed by execute(). Renewal reads it rather than renewing
         # everything stamped with this worker_id, so a row whose execution
@@ -1135,25 +1616,13 @@ class Worker:
         # Said once per worker, not once per claim.
         self._claim_filter_notice = False
         self._backstop_only_lock = Lock()
+        # The running attempt's policy, per pool thread; see _AttemptPolicy.
+        self._attempt_local = threading.local()
+        # Said at startup when the options configure a timeout, and otherwise
+        # by the first attempt that arms one, which is how a worker whose
+        # only timeouts are tasks' own finds out.
         if self.timeouts.enabled and _inject_async_exc is None:
-            self._backstop_only_notice = True
-            logger.warning(
-                "Worker %s cannot raise TaskTimeout inside a running task on "
-                "this interpreter, so the %gs grace backstop is the whole "
-                "enforcement. A task that returns before the backstop fires "
-                "is recorded as whatever it did, however long it ran; one "
-                "still running when it fires is recorded as failed and "
-                "recycles this worker with exit code %d",
-                self.worker_id,
-                self.timeouts.grace,
-                RECYCLE_EXIT_CODE,
-                extra={
-                    "event": "timeouts_backstop_only",
-                    "worker_id": self.worker_id,
-                    "reason": "interpreter",
-                    "grace_s": self.timeouts.grace,
-                },
-            )
+            self._note_injection_unavailable()
 
     # -- logging -----------------------------------------------------------
 
@@ -1700,6 +2169,204 @@ class Worker:
             setattr(db_task, name, value)
         return True
 
+    def _write_outcome_reconnecting(
+        self,
+        db_task: OxTask,
+        *,
+        status: OxTask.Status,
+        duration_ms: int,
+        **fields: Any,
+    ) -> bool:
+        """
+        _write_outcome for an attempt's own record, written once more on
+        another connection when the first write finds this thread's
+        connection to the worker's database gone. Returns what _write_outcome
+        returns, or False, having logged it, when the second try fails as
+        well.
+
+        The drop before the write, _discard_unusable_connections, catches a
+        connection one of the task's statements failed on. It cannot see
+        one that died while the task was not using it: the server ended
+        the session while the task worked on after its last query, or
+        restarted between two tasks while this thread kept a persistent
+        connection and the next task made no query. The outcome write is
+        then the first statement on the dead connection, and it raised,
+        left the row RUNNING with its lease no longer renewed, and the
+        reaper ran a finished task again, or requeued a failure with
+        neither its error nor its backoff. A probe before every write would
+        cost a statement on every outcome and still race with the drop, so
+        the write is its own probe, and only its failure costs anything.
+
+        Only a lost connection earns the second try: an OperationalError or
+        InterfaceError, after which _outcome_connection_lost holds. A lock
+        or statement timeout, a serialization failure or SQLite's "database
+        is locked" leave a connection that still answers, which a reconnect
+        repairs nothing about, and they are raised as before; so is
+        anything inside a caller's transaction, which a close would end.
+        The task body never runs again, only the write, with the values
+        the caller computed once, run_after and the errors list included.
+
+        Between the two tries the dead connection is closed and, with
+        Django's PostgreSQL pool, the pool's idle connections are swept,
+        _close_lost_connection. After a restart they are all as dead as
+        this one, and the second try would otherwise check one of them out
+        and fail the same way. The sweep does not promise the second try a
+        fresh connection: a replacement may still be connecting, the
+        database may still be down, and a connection the sweep found alive
+        can drop the moment after. The second try then fails as the first
+        did. There is no third, and no wait before the second.
+
+        A write can commit and still raise, when the connection goes
+        between the commit and its reply. Writing it again records nothing
+        twice: every field is a value, not an increment, and the landed
+        write took the row out of WRITABLE_STATUSES, so the fence matches
+        nothing. The fence cannot say why it matched nothing, though, and
+        _write_outcome would log a lease loss, and the caller skip
+        task_finished, for an outcome that is on the row. So the second
+        try first asks whether the row already holds this write,
+        _outcome_already_written, and one that does is taken as written.
+        A first write the server is still running when the second try
+        asks, because the client gave up on a session the server has not
+        yet ended, is not seen: the second write waits on its row lock,
+        matches nothing once it commits, and the attempt logs a lease loss
+        for an outcome that is on the row, once.
+
+        A second failure is logged once, as task_outcome_unrecorded, and
+        not raised. The outcome is then unconfirmed, not necessarily
+        absent: the first write may have landed, or another recovery path,
+        the watchdog's stuck-attempt record or a reaper, may already have
+        fenced this attempt. A row that still awaits recovery is the
+        reaper's once its lease expires, as before. The line says as much,
+        which "Unhandled error executing task" did not. Nothing waits
+        between the two tries, so an outage of any length that spans both
+        ends here. Whatever the second try raises that is not a database
+        error is raised.
+        """
+        try:
+            return self._write_outcome(
+                db_task, status=status, duration_ms=duration_ms, **fields
+            )
+        except (InterfaceError, OperationalError) as exc:
+            if not self._outcome_connection_lost():
+                raise
+            lost = f"{type(exc).__qualname__}: {_reason(exc)}"
+        conn = connections[self._db_alias]
+        # Outside any atomic block, so the close forgets the dead connection
+        # and the next statement checks out or opens another. With Django's
+        # pool that other one would be one the pool held idle, which a
+        # restart left as dead as this one, so the pool is swept first; even
+        # so, the next one is not certain to be alive.
+        _close_lost_connection(conn)
+        try:
+            written = self._outcome_already_written(db_task, status, fields)
+            landed = written or self._write_outcome(
+                db_task, status=status, duration_ms=duration_ms, **fields
+            )
+        except Error as exc:
+            with suppress(Error):
+                conn.close()
+            logger.error(
+                "Task id=%s path=%s lost its connection to database %r writing "
+                "the %s outcome of attempt %d/%d (%s), and a new connection "
+                "failed too (%s: %s). The outcome is unconfirmed, not "
+                "necessarily absent: the first write may have landed, or "
+                "another recovery path may already have fenced this attempt. "
+                "If the row still awaits recovery, the reaper handles it once "
+                "its lease expires",
+                db_task.id,
+                db_task.task_path,
+                self._db_alias,
+                status,
+                db_task.attempts,
+                db_task.max_attempts,
+                lost,
+                type(exc).__qualname__,
+                _reason(exc),
+                exc_info=True,
+                extra=self._log_extra(
+                    "task_outcome_unrecorded",
+                    db_task,
+                    duration_ms=duration_ms,
+                    dropped_status=str(status),
+                ),
+            )
+            return False
+        if written:
+            db_task.status = status
+            for name, value in fields.items():
+                setattr(db_task, name, value)
+        if landed:
+            logger.warning(
+                "Task id=%s path=%s lost its connection to database %r writing "
+                "the %s outcome of attempt %d/%d (%s); %s",
+                db_task.id,
+                db_task.task_path,
+                self._db_alias,
+                status,
+                db_task.attempts,
+                db_task.max_attempts,
+                lost,
+                (
+                    "a new connection found it already written"
+                    if written
+                    else "wrote it on a new connection"
+                ),
+                extra=self._log_extra(
+                    "task_outcome_reconnected",
+                    db_task,
+                    duration_ms=duration_ms,
+                    outcome=str(status),
+                    already_written=written,
+                ),
+            )
+        return landed
+
+    def _outcome_connection_lost(self) -> bool:
+        """
+        Whether this thread's connection to the worker's database is gone,
+        and the worker's to replace, after an outcome write raised.
+
+        Inside an atomic block it belongs to whoever opened the block, an
+        inline run_once() in a caller's transaction, or an override of
+        _write_outcome that wraps it in one, and closing it would end their
+        transaction; the error is theirs. A connection a caller took out of
+        autocommit is theirs for the same reason. Otherwise it is gone when
+        there is none open, because the connect itself failed or the driver
+        dropped it, or when is_usable() fails: one probe, only here.
+        """
+        conn = connections[self._db_alias]
+        if conn.in_atomic_block:
+            return False
+        if conn.connection is None:
+            return True
+        return bool(conn.autocommit) and not conn.is_usable()
+
+    def _outcome_already_written(
+        self, db_task: OxTask, status: OxTask.Status, fields: dict[str, Any]
+    ) -> bool:
+        """
+        Whether the row already holds this outcome write: its status, at
+        the epoch the write leaves, with every column it set that compares
+        in SQL. The JSON columns are left out, because equality on them
+        differs by database, and the rest already pin the write down:
+        finished_at or run_after is this process's clock to the
+        microsecond, and nothing else writes it at this epoch.
+        """
+        match = {
+            name: value
+            for name, value in fields.items()
+            if not isinstance(OxTask._meta.get_field(name), JSONField)
+        }
+        return (
+            OxTask.objects.using(self._db_alias)
+            .filter(
+                pk=db_task.pk,
+                status=status,
+                **{"lease_epoch": db_task.lease_epoch, **match},
+            )
+            .exists()
+        )
+
     def execute(self, db_task: OxTask, *, inline: bool = False) -> None:
         """
         Run a claimed (RUNNING, locked) task to a terminal or retry state.
@@ -1720,20 +2387,60 @@ class Worker:
         with self._in_flight_lock:
             self._in_flight.add(held)
             self._running_on[ident] = held
+        # The policy _run_attempt resolves lives for this attempt only. A task
+        # that runs another inline finds its own restored afterwards.
+        outer = getattr(self._attempt_local, "policy", None)
+        self._attempt_local.policy = None
+        executing = _executing.set(db_task.task_path)
         try:
             self._run_attempt(db_task, inline=inline)
         finally:
+            _executing.reset(executing)
+            self._attempt_local.policy = outer
             with self._in_flight_lock:
                 self._in_flight.discard(held)
                 if self._running_on.get(ident) == held:
                     del self._running_on[ident]
 
     def _run_attempt(self, db_task: OxTask, *, inline: bool = False) -> None:
+        """
+        One attempt: rebuild the task, call it, record what happened.
+
+        The task is rebuilt from the row for every attempt, so the policy it
+        runs under is the one the code declares now, with the row's stored
+        budget. That policy is resolved once, here, and kept for this
+        attempt: the timeout is chosen before the call, and the backoff that
+        _handle_failure consults is the one this rebuild found, not a second
+        import halfway through recording the failure. An attempt that fails
+        before the rebuild, because the task no longer imports, its module
+        raised or its declaration was refused, has a policy with no task: it
+        takes the row's budget and the worker's backoff, and recording the
+        failure does not import the task again. execute() clears the policy
+        when the attempt ends.
+        """
         from .results import task_from_db, task_result_from_db
 
         started = time.monotonic()
+        attempt = (db_task.pk, db_task.lease_epoch)
+        # Before the task can open a block of its own: what is inside one
+        # now is the caller's, and a timeout leaves it to them.
+        callers = _caller_transactions()
+        self._attempt_local.policy = _AttemptPolicy(
+            attempt=attempt,
+            task=None,
+            backoff=None,
+            inline=inline,
+            caller_transactions=callers,
+        )
         try:
             task = task_from_db(db_task)
+            self._attempt_local.policy = _AttemptPolicy(
+                attempt=attempt,
+                task=task,
+                backoff=task_policy(task)[1],
+                inline=inline,
+                caller_transactions=callers,
+            )
             task_result = task_result_from_db(db_task, task=task)
             # send_robust: these are an observability surface, and a
             # receiver's exception is not the task's fault. task_started fires
@@ -1748,22 +2455,30 @@ class Worker:
                 db_task.max_attempts,
                 extra=self._log_extra("task_started", db_task),
             )
-            timeout = self.timeouts.for_queue(db_task.queue_name)
-            if timeout is None:
-                # No timeout on this queue: the call is the one the worker
-                # made directly, frame for frame, so the
-                # stored traceback of an ordinary failure is unchanged.
-                if task.takes_context:
-                    raw_return_value = task.call(
-                        TaskContext(task_result=task_result),
-                        *db_task.args,
-                        **db_task.kwargs,
-                    )
+            # The task's own timeout, then its queue's, then the worker's.
+            timeout = self.timeouts.for_attempt(
+                db_task.queue_name, task_policy(task)[2]
+            )
+            # A with statement adds no frame, so the seam leaves the stored
+            # traceback as it was; see _task_body.
+            with self._task_body(db_task):
+                if timeout is None:
+                    # No timeout for this attempt: the call is the one the
+                    # worker made directly, frame for frame, so the
+                    # stored traceback of an ordinary failure is unchanged.
+                    if task.takes_context:
+                        raw_return_value = task.call(
+                            TaskContext(task_result=task_result),
+                            *db_task.args,
+                            **db_task.kwargs,
+                        )
+                    else:
+                        raw_return_value = task.call(*db_task.args, **db_task.kwargs)
                 else:
-                    raw_return_value = task.call(*db_task.args, **db_task.kwargs)
-            else:
-                raw_return_value = self._call_task(task, db_task, task_result, timeout)
-            return_value = normalize_json(raw_return_value)
+                    raw_return_value = self._call_task(
+                        task, db_task, task_result, timeout
+                    )
+                return_value = normalize_json(raw_return_value)
         except TaskTimeout as exc:
             duration_ms = _elapsed_ms(started)
             logger.warning(
@@ -1800,7 +2515,16 @@ class Worker:
             self._handle_failure(db_task, exc, _elapsed_ms(started))
         else:
             duration_ms = _elapsed_ms(started)
-            if not self._write_outcome(
+            # A task that caught a database error which ended its connection
+            # still succeeded, and this write is the only record of it. On the
+            # dead connection it would raise, leave the row RUNNING with its
+            # lease no longer renewed, and the reaper would run the task
+            # again. Only connections an error left unusable are dropped, so
+            # an ordinary success costs no statement here. A connection that
+            # died unnoticed is found by the write itself, which then goes
+            # once more on another; _write_outcome_reconnecting says when.
+            self._discard_unusable_connections()
+            if not self._write_outcome_reconnecting(
                 db_task,
                 status=OxTask.Status.SUCCESSFUL,
                 duration_ms=duration_ms,
@@ -1835,6 +2559,24 @@ class Worker:
                 task_result=task_result_from_db(db_task, task=task),
             )
 
+    def _task_body(self, db_task: OxTask) -> AbstractContextManager[None]:
+        """
+        The context an attempt's task body runs in: entered once the task is
+        rebuilt, its task_started signal sent and its timeout chosen, and left
+        when the call has returned and its value been converted for storage,
+        before the outcome is recorded. It encloses nothing else, so a
+        failure in the rebuild, a signal or the outcome write never passes
+        through it.
+
+        The worker's own is empty. django_ox.testing.run_tasks() gives the
+        body a savepoint and runs its commit callbacks here. An exception the
+        body raises reaches the failure handling as the same object with the
+        same traceback, unless the context raises one of its own in its
+        place; the with statement that enters it is in _run_attempt's frame
+        and adds none.
+        """
+        return nullcontext()
+
     # -- timeouts ----------------------------------------------------------
 
     def _call_task(
@@ -1849,7 +2591,7 @@ class Worker:
 
         The attempt is registered with the watchdog for the duration of the
         call, and the attempt's deadline is published for deadline() and
-        remaining(). A queue with no timeout never comes here: _run_attempt
+        remaining(). An attempt with no timeout never comes here: _run_attempt
         calls the task directly.
 
         A sync task is interrupted by TaskTimeout raised on this thread, at
@@ -2021,8 +2763,29 @@ class Worker:
         transaction state first, so close() forgets the object. The lease
         epoch is unchanged, so the outcome write is the same write on
         either connection.
+
+        A connection that was already inside an atomic block when the
+        attempt started is not the attempt's to drop. It carries its
+        caller's transaction: run_once() inside their atomic(), or inside a
+        TestCase. Resetting and closing it rolled that transaction back and
+        left the connection in autocommit, so the caller's rows were gone
+        and every write after it committed for real. It stays open, with
+        its flags as they are, and is only put back at the caller's depth,
+        _restore_caller_transaction; the outcome write then lands inside
+        the caller's transaction. Which connections those are is recorded
+        as the attempt starts rather than read here. On a worker's own
+        thread no connection is inside a block when an attempt starts, and
+        one found inside a block now is there because the delivery cut
+        through the task's own atomic() entry or exit, the case the reset
+        above exists for.
         """
+        policy: _AttemptPolicy | None = getattr(self._attempt_local, "policy", None)
+        callers = () if policy is None else policy.caller_transactions
         for conn in connections.all(initialized_only=True):
+            caller = next((c for c in callers if c.connection is conn), None)
+            if caller is not None:
+                _restore_caller_transaction(conn, caller)
+                continue
             conn.in_atomic_block = False
             conn.savepoint_ids = []
             conn.atomic_blocks = []
@@ -2032,6 +2795,82 @@ class Worker:
             # when closing it raises; a connection broken this way may.
             with suppress(Error):
                 conn.close()
+
+    def _discard_unusable_connections(self) -> None:
+        """
+        Close this thread's connections that an error has left unusable, so
+        what runs next on this thread, the outcome write and a task's
+        backoff before it, checks out or opens another instead of failing
+        on the dead one. A failure checks twice when a backoff was asked:
+        before it, and after it, since the callback is task code and can end
+        one too.
+
+        A task can end its own connection and still reach an outcome: a
+        statement the server terminated, a failover, a network drop it
+        raised through or caught. Django notices only at the end of a
+        request, in close_old_connections(), and a worker's attempt is not
+        a request, so without this the write runs on the dead connection,
+        raises, and leaves the row RUNNING with its lease no longer renewed.
+
+        This is Django's own test from close_old_connections(), narrowed to
+        what is certain: a connection with an error since its last commit
+        that fails is_usable(). Checking only flagged connections keeps the
+        ordinary outcome free of any extra statement, and a flagged one that
+        still answers is kept. The price is that a connection that died with
+        no statement failing on it, while the task was not using it, is not
+        flagged, and the write is the first to find it dead; that write goes
+        once more on another connection, _write_outcome_reconnecting.
+
+        Closing a pooled connection hands it back for Django's pool to
+        discard, and the write then checks out one the pool held idle.
+        After a restart those are as dead as the one closed, so each close
+        here also sweeps its alias's pool, _close_lost_connection. That
+        does not make the write's connection certain to be alive: the
+        database may still be down, and a connection can drop after the
+        sweep found it alive. A connection that is kept, or that has no
+        pool, costs no sweep.
+
+        One inside an atomic block is left alone: it belongs to whoever
+        opened the block, and closing it would end their transaction; an
+        inline run_once() inside a caller's transaction is theirs. Every
+        alias this thread has opened is checked, not only the worker's: the
+        task_finished receivers after the write run on this thread too. Runs
+        on the attempt's own thread only, because Django's connections are
+        per thread and another thread's are not this one's to close.
+        """
+        for conn in connections.all(initialized_only=True):
+            if conn.connection is None or conn.in_atomic_block:
+                continue
+            if conn.errors_occurred and not conn.is_usable():
+                _close_lost_connection(conn)
+
+    def _note_injection_unavailable(self) -> None:
+        """
+        Say once, not once per attempt, that this interpreter cannot raise
+        TaskTimeout inside a thread, so the grace backstop is the whole
+        enforcement.
+        """
+        with self._backstop_only_lock:
+            if self._backstop_only_notice:
+                return
+            self._backstop_only_notice = True
+        logger.warning(
+            "Worker %s cannot raise TaskTimeout inside a running task on "
+            "this interpreter, so the %gs grace backstop is the whole "
+            "enforcement. A task that returns before the backstop fires "
+            "is recorded as whatever it did, however long it ran; one "
+            "still running when it fires is recorded as failed and "
+            "recycles this worker with exit code %d",
+            self.worker_id,
+            self.timeouts.grace,
+            RECYCLE_EXIT_CODE,
+            extra={
+                "event": "timeouts_backstop_only",
+                "worker_id": self.worker_id,
+                "reason": "interpreter",
+                "grace_s": self.timeouts.grace,
+            },
+        )
 
     def _note_backstop_only(self, tracer: str) -> None:
         """
@@ -2078,6 +2917,8 @@ class Worker:
         )
         if tracer is not None:
             self._note_backstop_only(tracer)
+        elif injectable and _inject_async_exc is None:
+            self._note_injection_unavailable()
         now = time.monotonic()
         watch = _Watch(
             ident=ident,
@@ -2212,11 +3053,26 @@ class Worker:
         sequence, whatever the batch's size, except that resolving a host
         name is not bounded by the deadline. The connection is closed, or
         given back to the pool, when the batch ends, however it ends; the
-        next batch acquires one again. Without a pool the batch runs on the
-        thread's ordinary connection, as Django opens it.
+        next batch acquires one again.
+
+        Without a pool the batch runs on the thread's ordinary connection,
+        as Django opens it, and that too is closed when the batch ends,
+        however it ends. The thread lives as long as any attempt is under a
+        timeout, and nothing else closes its connection until the thread
+        exits. Kept, a connection the server ended between two batches (a
+        restart, a failover) failed every record of the second, and each of
+        those rows stayed RUNNING until the reaper took it back, with no
+        TaskTimeout recorded and no backoff. A connection that breaks during
+        a batch still fails the records after it, as the pooled batch's does.
         """
         if own is None:
-            yield
+            try:
+                yield
+            finally:
+                # Quiet about a database error, as own.close() is; anything
+                # else reaches _record_stuck, which logs it and carries on.
+                with suppress(Error):
+                    connections[self._db_alias].close()
             return
         with ExitStack() as scope:
             scope.callback(own.close)
@@ -2437,13 +3293,41 @@ class Worker:
         Record a failed attempt: a retry with backoff, or FAILED when the
         attempts are spent. Returns True when the write landed.
 
+        The row's max_attempts decides whether attempts are spent, whatever
+        the task declares now. With attempts left, the delay is the task's
+        own backoff's answer when the attempt resolved one (see
+        _backoff_decision), and the worker's exponential backoff otherwise.
+        A backoff that answers None records FAILED now.
+
         release=True is the stuck-thread case. The execution is being taken
         off the row while its thread is still running, so the write also
         moves the lease epoch, the same way the reaper moves it when it
         takes a row off a worker that went quiet. Whatever that thread
-        writes later carries the old number and matches nothing.
+        writes later carries the old number and matches nothing. That path
+        never calls a task's backoff: it runs on the watchdog thread, whose
+        job is to fence the row and recycle the worker, not to run task code.
         """
         from .results import task_result_from_db
+
+        if not release:
+            # A task can end its own connection and then fail, often because
+            # of it: a statement the server terminated, a network drop it
+            # raised through. The write below runs on this thread's
+            # connection for the worker's alias, and on the dead one it
+            # raises: the row stays RUNNING with its lease no longer renewed,
+            # the error is never recorded, and the reaper later requeues the
+            # row with no backoff, or marks it LOST on its last attempt. The
+            # task's backoff, when there is one to ask, runs next on the
+            # same fresh connections. The stuck-thread record, release=True,
+            # runs on the watchdog's own connection while the task's thread
+            # may still be using its own, which is not the watchdog's to
+            # close.
+            self._discard_unusable_connections()
+        # The attempt's own record goes once more on another connection
+        # when the write finds this thread's connection gone; the stuck-thread
+        # record is the watchdog's, on its own connection, and keeps the
+        # single write it always had.
+        write = self._write_outcome if release else self._write_outcome_reconnecting
 
         handover: dict[str, Any] = (
             {"lease_epoch": db_task.lease_epoch + 1} if release else {}
@@ -2458,9 +3342,35 @@ class Worker:
                 "traceback": _stored_traceback(exc),
             },
         ]
+        policy = None if release else self._attempt_policy(db_task)
 
-        if db_task.attempts >= db_task.max_attempts:
-            if not self._write_outcome(
+        delay: float | None = None
+        declined = False
+        if db_task.attempts < db_task.max_attempts:
+            if policy is not None and policy.backoff is not None:
+                delay, declined = self._backoff_decision(policy, db_task, exc, errors)
+                # The callback is task code on this thread's connections, and
+                # it can end one the way the task can: a statement the server
+                # terminated, a network drop, caught or raised through. The
+                # write below would then fail on it as it would have on the
+                # task's. Checked again, at no cost unless an error flagged
+                # a connection.
+                self._discard_unusable_connections()
+            if delay is None and not declined:
+                # The exponent is capped before the multiplication, not
+                # after. `attempts` is a PositiveSmallIntegerField and can
+                # reach 32767, and 2 ** 32766 overflows on the way to a float
+                # the min() would have discarded. This runs on the failure
+                # path, where raising would leave the row RUNNING for the
+                # reaper.
+                #
+                # Capping at 64 doublings is far past any backoff_max anyone
+                # configures and keeps the arithmetic in range.
+                doublings = min(max(db_task.attempts - 1, 0), 64)
+                delay = min(self.backoff_initial * (2**doublings), self.backoff_max)
+
+        if delay is None:
+            if not write(
                 db_task,
                 status=OxTask.Status.FAILED,
                 duration_ms=duration_ms,
@@ -2473,42 +3383,67 @@ class Worker:
                 **handover,
             ):
                 return False
-            try:
-                task_result = task_result_from_db(db_task)
-            except ImportError:
-                # Task module no longer importable; the row still records
-                # the failure, but no result object can be built to signal.
-                task_result = None
+            task_result: TaskResult[..., Any] | None = None
+            if policy is None:
+                # No attempt on this thread: the stuck-thread handover, or a
+                # caller recording a failure directly. Nothing says whether
+                # the task imports, so it is imported to find out.
+                try:
+                    task_result = task_result_from_db(db_task)
+                except ImportError:
+                    # Task module no longer importable; the row still records
+                    # the failure, but no result object can be built to signal.
+                    task_result = None
+            elif policy.task is not None:
+                # The task this attempt rebuilt, rather than a second import
+                # of code that may have changed since.
+                task_result = task_result_from_db(db_task, task=policy.task)
+            # Otherwise this attempt failed before it had a task, and that
+            # failure is the one being recorded. A second import would fail
+            # again, and not always with ImportError: a module that raises
+            # TypeError or InvalidTask while importing would escape here,
+            # after the FAILED write and before task_failed is logged, and
+            # the final attempt would read as a worker_error. There is no
+            # task to build a result from, so no task_finished is sent.
             if task_result is not None:
                 task_finished.send_robust(
                     sender=type(self.backend), task_result=task_result
                 )
-            logger.error(
-                "Task id=%s path=%s failed after %d/%d attempts (%s)",
-                db_task.id,
-                db_task.task_path,
-                db_task.attempts,
-                db_task.max_attempts,
-                exception_type.__qualname__,
-                extra=self._log_extra(
-                    "task_failed",
-                    db_task,
-                    duration_ms=duration_ms,
-                    exception=exception_type.__qualname__,
-                ),
-            )
+            if declined:
+                logger.error(
+                    "Task id=%s path=%s failed on attempt %d/%d (%s); its "
+                    "backoff returned None, so it is not retried",
+                    db_task.id,
+                    db_task.task_path,
+                    db_task.attempts,
+                    db_task.max_attempts,
+                    exception_type.__qualname__,
+                    extra=self._log_extra(
+                        "task_failed",
+                        db_task,
+                        duration_ms=duration_ms,
+                        exception=exception_type.__qualname__,
+                        reason="backoff_declined",
+                    ),
+                )
+            else:
+                logger.error(
+                    "Task id=%s path=%s failed after %d/%d attempts (%s)",
+                    db_task.id,
+                    db_task.task_path,
+                    db_task.attempts,
+                    db_task.max_attempts,
+                    exception_type.__qualname__,
+                    extra=self._log_extra(
+                        "task_failed",
+                        db_task,
+                        duration_ms=duration_ms,
+                        exception=exception_type.__qualname__,
+                        reason="attempts_exhausted",
+                    ),
+                )
         else:
-            # The exponent is capped before the multiplication, not after.
-            # `attempts` is a PositiveSmallIntegerField and can reach 32767,
-            # and 2 ** 32766 overflows on the way to a float the min() would
-            # have discarded. This runs on the failure path, where raising
-            # would leave the row RUNNING for the reaper.
-            #
-            # Capping at 64 doublings is far past any backoff_max anyone
-            # configures and keeps the arithmetic in range.
-            doublings = min(max(db_task.attempts - 1, 0), 64)
-            delay = min(self.backoff_initial * (2**doublings), self.backoff_max)
-            if not self._write_outcome(
+            if not write(
                 db_task,
                 status=OxTask.Status.READY,
                 duration_ms=duration_ms,
@@ -2533,9 +3468,128 @@ class Worker:
                     db_task,
                     duration_ms=duration_ms,
                     exception=exception_type.__qualname__,
+                    retry_in_s=delay,
                 ),
             )
         return True
+
+    def _attempt_policy(self, db_task: OxTask) -> _AttemptPolicy | None:
+        """The policy this thread's attempt on `db_task` resolved, if any."""
+        policy: _AttemptPolicy | None = getattr(self._attempt_local, "policy", None)
+        if policy is None or policy.attempt != (db_task.pk, db_task.lease_epoch):
+            return None
+        return policy
+
+    def _backoff_decision(
+        self,
+        policy: _AttemptPolicy,
+        db_task: OxTask,
+        exc: BaseException,
+        errors: list[dict[str, str]],
+    ) -> tuple[float | None, bool]:
+        """
+        Ask the task's backoff about this failure: ``(delay, declined)``.
+
+        ``(seconds, False)`` retries after that many seconds, which may
+        exceed BACKOFF_MAX: the backend's caps bound its own formula, not a
+        task's answer. ``(None, True)`` is the callback answering None,
+        which records FAILED now. ``(None, False)`` is a callback that
+        raised or answered something unusable; that is logged as
+        ``task_policy_error`` and the worker's backoff decides instead.
+        Either way the failure recorded is the task's own exception, never
+        the callback's.
+
+        The callback runs synchronously on the attempt's thread, before the
+        outcome write and inside no transaction of ours, with no row lock
+        held. It gets the exception and a TaskResult as the row would read
+        if this attempt were final: FAILED, this claim in attempts and
+        worker_ids, this error last in errors. That snapshot is in memory
+        only; the row goes to READY or FAILED by the write that follows.
+        It uses this thread's ordinary Django connections, after
+        _handle_failure has dropped any that a timeout or a database error
+        left unusable, and any it leaves unusable are dropped again before
+        the write. Nothing bounds how long it runs, so it has to be quick.
+        """
+        from .results import task_result_from_db
+
+        snapshot = copy.copy(db_task)
+        snapshot.status = OxTask.Status.FAILED
+        snapshot.errors = errors
+        snapshot.finished_at = timezone.now()
+        backoff = cast("BackoffCallback", policy.backoff)
+        try:
+            answer = backoff(exc, task_result_from_db(snapshot, task=policy.task))
+        except (KeyboardInterrupt, SystemExit):
+            # Aimed at the caller's process when inline, as the task's own
+            # would be; see _run_attempt. On the pool it is the callback
+            # failing like any other.
+            if policy.inline:
+                raise
+            self._log_policy_error(db_task, exc, "raised", exc_info=True)
+            return None, False
+        # Any other BaseException too: asyncio.CancelledError, or a class of
+        # the application's own. Let out of here on the pool, it would leave
+        # _handle_failure before the outcome write and the thread with no
+        # log line, the row RUNNING until its lease expired and the task's
+        # own error never recorded. Inline, one that is not an Exception is
+        # the caller's to handle, as the two above are.
+        except BaseException as policy_error:
+            if policy.inline and not isinstance(policy_error, Exception):
+                raise
+            self._log_policy_error(db_task, exc, "raised", exc_info=True)
+            return None, False
+        if answer is None:
+            return None, True
+        if inspect.isawaitable(answer):
+            if inspect.iscoroutine(answer):
+                # Never awaited, and closed so Python does not warn that it
+                # was not.
+                answer.close()
+            self._log_policy_error(
+                db_task, exc, "returned an awaitable, which is not awaited"
+            )
+            return None, False
+        seconds: float | None = None
+        if isinstance(answer, timedelta):
+            seconds = answer.total_seconds()
+        elif isinstance(answer, int) and not isinstance(answer, bool):
+            seconds = answer
+        if seconds is None or not 0 <= seconds <= MAX_SECONDS:
+            self._log_policy_error(
+                db_task,
+                exc,
+                f"returned {answer!r}, not a whole number of seconds or a "
+                f"timedelta from 0 to {MAX_SECONDS:.0f} seconds, or None",
+            )
+            return None, False
+        return float(seconds), False
+
+    def _log_policy_error(
+        self,
+        db_task: OxTask,
+        exc: BaseException,
+        what: str,
+        *,
+        exc_info: bool = False,
+    ) -> None:
+        logger.error(
+            "Task id=%s path=%s attempt %d/%d failed (%s), and its backoff %s; "
+            "retrying on the worker's backoff instead",
+            db_task.id,
+            db_task.task_path,
+            db_task.attempts,
+            db_task.max_attempts,
+            type(exc).__qualname__,
+            what,
+            exc_info=exc_info,
+            extra=self._log_extra(
+                "task_policy_error",
+                db_task,
+                policy="backoff",
+                exception=type(exc).__qualname__,
+                error=what,
+            ),
+        )
 
     # -- reaping -----------------------------------------------------------
 
@@ -2889,6 +3943,87 @@ class Worker:
         OxScheduleTick.objects.using(self._db_alias).filter(pk=latch.pk).delete()
         return earliest
 
+    def _session(self) -> tuple[Any, Any] | None:
+        """
+        The database session this worker's connection is on right now, as
+        something to compare later, or None when there is no connection.
+
+        Read from the driver's own state, with no round trip: the driver's
+        connection object, and the server's id for the session where there
+        is one (PostgreSQL's backend pid, MySQL's connection id). The object
+        alone is not enough. PyMySQL reconnects in place, keeping the
+        object and changing the session under it, whenever a ping is made
+        with reconnect on, which Django's `is_usable()` does.
+        """
+        connection = connections[self._db_alias]
+        raw = connection.connection
+        if raw is None:
+            return None
+        server_id: Any = None
+        try:
+            if connection.vendor == "postgresql":
+                info = getattr(raw, "info", None)
+                server_id = (
+                    info.backend_pid if info is not None else raw.get_backend_pid()
+                )
+            elif connection.vendor == "mysql":
+                server_id = raw.thread_id()
+        except Exception:
+            # A driver that cannot say which session it is on is not on
+            # the one it was: an object equal to nothing else.
+            server_id = object()
+        return (raw, server_id)
+
+    def _unusable_after_failure(self, before: tuple[Any, Any] | None) -> str | None:
+        """
+        Why the dispatch pass cannot go on after one schedule's block
+        failed, or None when it can. `before` is `_session()` from just
+        before the block.
+
+        Asked after the block's rollback, of the connection that ran it and
+        on the alias it ran on. Three things end the pass.
+
+        A session that is not the one the block ran on. When an outermost
+        rollback fails, Django closes the connection, and the same exit
+        then turns autocommit back on, which opens a new one. By the time
+        anyone looks there is a connection and it works, and it is not the
+        one that failed: judged by whether it answers, a server that had
+        dropped the session reads as a schedule the database refused.
+
+        An enclosing transaction marked for rollback: inside a transaction
+        the caller owns, a savepoint whose rollback failed leaves nothing
+        more that can run this pass.
+
+        A session that does not answer a trivial query once the rollback is
+        through. The query goes out on the connection as it stands, never
+        through Django's `is_usable()`, which on PyMySQL pings with
+        reconnect on.
+        """
+        connection = connections[self._db_alias]
+        after = self._session()
+        if (
+            after is None
+            or before is None
+            or after[0] is not before[0]
+            or after[1] != before[1]
+        ):
+            return (
+                "the connection a schedule's dispatch ran on was lost; its "
+                "rollback did not go through"
+            )
+        if connection.needs_rollback:
+            return (
+                "the rollback to a schedule's savepoint did not go through, "
+                "and the enclosing transaction can only be rolled back"
+            )
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute(f"SELECT 1{connection.features.bare_select_suffix}")
+                cursor.fetchone()
+        except Error as exc:
+            return f"the connection did not answer after a schedule's failure: {exc}"
+        return None
+
     def _log_tick_dropped(
         self, schedule: Schedule, scheduled_for: datetime, now: datetime
     ) -> None:
@@ -2970,8 +4105,52 @@ class Worker:
         latest missed tick fires. A schedule with no rows yet is anchored
         at its current tick without firing, so it first fires at the next
         tick after deployment rather than for a time before it existed.
+
+        One schedule's failure is that schedule's, whatever raised it. Each
+        schedule is dispatched in a transaction of its own, and everything
+        that concerns that schedule alone runs inside the boundary around
+        it: the read asking whether a future-dated tick already covers it,
+        its row lock, the tick INSERT, the enqueue and the tick update.
+        When any of those raises, the transaction rolls back, the tick stays
+        unclaimed, and the pass goes on to the next schedule, provided the
+        rollback went through and the same connection still answers a
+        trivial query. A database that refuses one schedule's arguments,
+        which PostgreSQL does with a DataError, MySQL with an
+        OperationalError and SQLite with an IntegrityError for the same
+        non-finite float, is one `schedule_dispatch_error` on every engine,
+        and the schedules after it still fire.
+
+        The exception's class cannot make that call. A class names what the
+        driver saw, not whose failure it was: the same OperationalError is a
+        refused argument on MySQL and a dropped connection anywhere. What a
+        refusal leaves behind is a connection that still works, and what an
+        outage leaves is one that does not, so that is what is asked. A
+        check that passes says the connection is usable, not that the
+        failure was the schedule's for good. The schedule is tried again on
+        the next pass under the usual rules and fires once whatever refused
+        it stops refusing.
+
+        The pass fails, and this raises, when the failure is not one
+        schedule's: a shared read before the loop (the source's own reads,
+        the bounded tick read), a rollback that did not go through, or a
+        connection that does not answer after one. Nothing is given up on
+        the strength of how many schedules failed before: a run of refused
+        schedules followed by a healthy one leaves the healthy one to fire.
         """
         schedules = self._schedule_source.schedules()
+        # Forget schedules that no longer exist, so the failure report
+        # holds state for at most the schedules that do. That is wider than
+        # the ones answered this pass: a stored row that is paused is left
+        # out of them, and forgetting it at the pause would report the same
+        # refusal as a new first failure, traceback and all, if it resumes
+        # unrepaired, and no recovery if it was repaired while paused. The
+        # stored source says which rows exist from the reads it already
+        # makes; any other source is taken at its answer.
+        keys = {schedule.key for schedule in schedules}
+        stored_keys = getattr(self._schedule_source, "_stored_keys", None)
+        if stored_keys is not None:
+            keys |= stored_keys()
+        self._dispatch_report.retain(keys)
         if not schedules:
             return 0
         now = timezone.now()
@@ -3014,32 +4193,7 @@ class Worker:
             if schedule.end_time is not None and scheduled_for > schedule.end_time:
                 continue
             last = latest.get(schedule.key)
-            if last is not None and scheduled_for <= last:
-                if last <= now:
-                    continue
-                # The newest tick in the log is in the future, which a
-                # clock-skewed worker's write can leave behind. That must not
-                # suppress ticks which are due now, so the comparison against
-                # the newest one cannot decide this. Ask about this instant
-                # instead: if it has already been recorded, it has run.
-                #
-                # One extra query, and only while a future tick is the newest
-                # one. In ordinary operation the comparison above answers.
-                if (
-                    OxScheduleTick.objects.using(self._db_alias)
-                    .filter(schedule_name=schedule.key, scheduled_for=scheduled_for)
-                    .exists()
-                ):
-                    continue
-            # After the suppression, not before. A tick that already fired
-            # is not a tick that was dropped, and checking the deadline
-            # first would report one as dropped on every pass until its
-            # next tick came due, which for a daily schedule is a warning
-            # a second for a day.
-            if schedule.starting_deadline is not None and (
-                now - scheduled_for > schedule.starting_deadline
-            ):
-                self._log_tick_dropped(schedule, scheduled_for, now)
+            if last is not None and scheduled_for <= last and last <= now:
                 continue
             result = None
             # Set once this pass's tick row is in. An IntegrityError arriving
@@ -3062,8 +4216,47 @@ class Worker:
                 nonlocal committed
                 committed = True
 
+            # Set once the block has exited without an exception: the tick
+            # is committed, or, inside a transaction the caller owns, its
+            # savepoint is released. Either way this schedule dispatched.
+            settled = False
+            # The session this schedule's block runs on, to tell afterwards
+            # whether a failure left it standing. Opened first if nothing
+            # has yet, so a connection the block itself opens is not taken
+            # for a replacement.
+            connections[self._db_alias].ensure_connection()
+            session = self._session()
             try:
                 try:
+                    # The newest tick in the log is in the future, which a
+                    # clock-skewed worker's write can leave behind. That must
+                    # not suppress ticks which are due now, so the comparison
+                    # against the newest one cannot decide this. Ask about
+                    # this instant instead: if it has already been recorded,
+                    # it has run.
+                    #
+                    # One extra query, and only while a future tick is the
+                    # newest one. In ordinary operation the comparison before
+                    # this block answers. Inside the boundary, since it is a
+                    # read about this schedule alone.
+                    if (
+                        last is not None
+                        and scheduled_for <= last
+                        and OxScheduleTick.objects.using(self._db_alias)
+                        .filter(schedule_name=schedule.key, scheduled_for=scheduled_for)
+                        .exists()
+                    ):
+                        continue
+                    # After the suppression, not before. A tick that already
+                    # fired is not a tick that was dropped, and checking the
+                    # deadline first would report one as dropped on every
+                    # pass until its next tick came due, which for a daily
+                    # schedule is a warning a second for a day.
+                    if schedule.starting_deadline is not None and (
+                        now - scheduled_for > schedule.starting_deadline
+                    ):
+                        self._log_tick_dropped(schedule, scheduled_for, now)
+                        continue
                     with transaction.atomic(using=self._db_alias):
                         transaction.on_commit(mark_committed, using=self._db_alias)
                         # The definition as it stands now, under its own lock.
@@ -3171,6 +4364,7 @@ class Worker:
                             )
                             tick_row.task_id = result.id
                             tick_row.save(using=self._db_alias, update_fields=["task"])
+                    settled = True
                 except Exception:
                     if not committed:
                         raise
@@ -3200,76 +4394,63 @@ class Worker:
                 # unclaimed so a worker with a current view can still act
                 # on it.
                 continue
-            except IntegrityError:
-                # Two things raise this inside the block, told apart by how
-                # far the block had got. Before the tick row is in, it is the
-                # INSERT itself: another worker claimed this tick first, its
-                # INSERT won, and ours rolled back before it enqueued
-                # anything. Silent, and the ordinary case on every tick with
-                # more than one worker. Once the row is in, the failure is a
-                # later statement's, the enqueue's or the latch's, and
-                # reading it as a lost race would retry it silently for as
-                # long as it kept failing. Asking the log whether the tick
-                # row exists cannot tell them apart: a winner committing
-                # between the rollback and that read made a real failure
-                # look like a lost race.
-                if claimed:
-                    logger.exception(
-                        "Schedule %s could not be dispatched this pass",
+            except Exception as exc:
+                if (
+                    not claimed
+                    and isinstance(exc, IntegrityError)
+                    and _lost_the_race(exc)
+                ):
+                    # Another worker claimed this tick first: its INSERT won
+                    # the unique constraint and ours rolled back before it
+                    # enqueued anything. Silent, and the ordinary case on
+                    # every tick with more than one worker, so it costs no
+                    # check of the connection either: a duplicate key is the
+                    # database answering. Only this: before the tick row is
+                    # in, and only a duplicate key. Once the row is in, the
+                    # failure is a later statement's, the enqueue's or the
+                    # latch's, and reading it as a lost race would retry it
+                    # silently for as long as it kept failing. Asking the log
+                    # whether the tick row exists cannot tell them apart
+                    # either: a winner committing between the rollback and
+                    # that read made a real failure look like a lost race.
+                    continue
+                # Whether the pass can go on is the connection's to say, not
+                # the exception's; dispatch_schedules says why.
+                broken = self._unusable_after_failure(session)
+                if broken is not None:
+                    if isinstance(exc, DatabaseError):
+                        raise
+                    raise DatabaseError(broken) from exc
+                if isinstance(exc, OperationalError) and lock_contention(exc):
+                    # The database gave up waiting for a lock: another
+                    # worker held this tick's unique row, or the schedule's
+                    # row, for longer than the engine's patience. That is a
+                    # lost race with a slow winner, not a broken schedule,
+                    # so it is one warning without a traceback, and the tick
+                    # fires on a later pass if it is still unclaimed. The
+                    # stored source treats a timeout on its own row lock the
+                    # same way.
+                    logger.warning(
+                        "Could not claim schedule %s this pass, the database "
+                        "gave up waiting for a lock: %s",
                         schedule.name,
+                        exc,
                         extra={
-                            "event": "schedule_dispatch_error",
+                            "event": "schedule_lock_unavailable",
                             "schedule": schedule.name,
                             "worker_id": self.worker_id,
                         },
                     )
-                continue
-            except OperationalError as exc:
-                # The database gave up waiting for a lock: another worker
-                # held this tick's unique row, or the schedule's row, for
-                # longer than the engine's patience. That is a lost race
-                # with a slow winner, not a broken schedule, so it is one
-                # warning without a traceback, and the tick fires on a later
-                # pass if it is still unclaimed. The stored source treats a
-                # timeout on its own row lock the same way.
-                if not lock_contention(exc):
-                    raise
-                logger.warning(
-                    "Could not claim schedule %s this pass, the database gave up "
-                    "waiting for a lock: %s",
-                    schedule.name,
-                    exc,
-                    extra={
-                        "event": "schedule_lock_unavailable",
-                        "schedule": schedule.name,
-                        "worker_id": self.worker_id,
-                    },
-                )
-                continue
-            except DatabaseError:
-                # The database, not the schedule: a connection gone away, a
-                # server refusing a statement, a lock the engine gave up
-                # waiting for. Read as one bad row, it was logged against
-                # whichever schedule was in hand, with a traceback, once per
-                # schedule, while the pass returned as if it had succeeded
-                # and the handler in run() written for exactly this never
-                # ran. It goes there instead.
-                raise
-            except Exception:
-                # Anything else at all. A schedule read from a row is
-                # input from a person, and the guarantee that one bad
-                # row cannot stop the others has to hold for the
-                # exception nobody predicted as much as for the ones
-                # that were.
-                logger.exception(
-                    "Schedule %s could not be dispatched this pass",
-                    schedule.name,
-                    extra={
-                        "event": "schedule_dispatch_error",
-                        "schedule": schedule.name,
-                        "worker_id": self.worker_id,
-                    },
-                )
+                    continue
+                # This schedule's own failure, database or not: arguments the
+                # database refused, a task that will not enqueue, a
+                # task_enqueued receiver whose SQL aborted the transaction, a
+                # row that raised. A schedule read from a row is input from a
+                # person, and the guarantee that one bad schedule cannot stop
+                # the others has to hold for the exception nobody predicted
+                # as much as for the ones that were. Tried again next pass;
+                # reported in full once and then in summary.
+                self._dispatch_report.schedule_failed(schedule, exc)
                 continue
             if result is not None:
                 dispatched += 1
@@ -3285,6 +4466,10 @@ class Worker:
                         "worker_id": self.worker_id,
                     },
                 )
+            # A committed tick, whether it enqueued or anchored, ends a run
+            # of failures for this schedule on this worker.
+            if settled or committed:
+                self._dispatch_report.schedule_dispatched(schedule)
         return dispatched
 
     # -- lifecycle ---------------------------------------------------------
@@ -3321,18 +4506,21 @@ class Worker:
         needed = self.concurrency + 1
         if max_size >= needed:
             return
-        if self.timeouts.enabled:
-            unpooled = 2
-            outside = (
-                "Lease renewal and the timeout watchdog normally use private "
-                "connections outside the pool; budget 2 additional connections"
-            )
-        else:
-            unpooled = 1
-            outside = (
-                "Lease renewal normally uses a private connection outside the pool; "
-                "budget 1 additional connection"
-            )
+        # Two whatever the options say. The watchdog opens its connection for
+        # any attempt that has a timeout, and a task can declare its own, so
+        # a worker whose options configure none can still start one; nothing
+        # at startup can say that no task it claims will. Counting it always
+        # is the budget that is never short. It is a worst case, not a count
+        # of what the worker will open, and the text says so: a worker whose
+        # tasks never have a timeout uses only the renewal connection.
+        unpooled = 2
+        outside = (
+            "Lease renewal normally uses a private connection outside the "
+            "pool. The timeout watchdog uses a second one whenever an attempt "
+            "has a timeout, and a task can declare its own, so this assumes "
+            "the worst case and counts both; if no task this worker runs has "
+            "a timeout, only the first is used. Budget 2 additional connections"
+        )
         logger.warning(
             "Worker %s: Django's PostgreSQL connection pool for database %r "
             "has a connection limit of %d. Allow at least %d pooled connections "
@@ -3397,6 +4585,23 @@ class Worker:
         """Stop claiming new tasks; in-flight tasks drain before run() exits."""
         self._stop.set()
 
+    def _beat(self) -> None:
+        # Called from the loop, the claims of a pass and the drain only, on
+        # the thread that runs them. A heartbeat written from any other
+        # thread, the renewer's or one of its own, would stay fresh while
+        # the loop it vouches for is wedged.
+        if self._heartbeat is None:
+            return
+        # An orphan no longer speaks for its slot. Its drain can last as
+        # long as its longest task, and a supervisor started in place of
+        # the dead one expects the same slot file from a child of its own;
+        # an orphan that kept writing it would pass the check for a slot the
+        # new fleet may have lost. Asked here, not only at the head of the
+        # loop, because the drain comes after the loop has noticed.
+        if self.parent_pid is not None and os.getppid() != self.parent_pid:
+            return
+        self._heartbeat.touch()
+
     @property
     def stopping(self) -> bool:
         return self._stop.is_set()
@@ -3437,17 +4642,31 @@ class Worker:
         # The instance was claimed on the main thread's connection; it is a
         # plain in-memory object here, and its saves use this thread's own
         # connection.
-        close_old_connections()
+        #
+        # Everything that runs here is inside the boundary, the connection
+        # setup and cleanup included, and the boundary is BaseException. The
+        # pool stores whatever escapes on this call's future, and nothing
+        # reads it, so it would be lost without a word. No KeyboardInterrupt
+        # reaches a pool thread, and there is no caller here for a SystemExit
+        # or a cancellation to reach, so logging it is all there is to do.
         try:
+            close_old_connections()
             self.execute(db_task)
-        except Exception:
+        except BaseException:
             logger.exception(
                 "Unhandled error executing task id=%s",
                 db_task.pk,
                 extra=self._log_extra("worker_error", db_task),
             )
         finally:
-            close_old_connections()
+            try:
+                close_old_connections()
+            except BaseException:
+                logger.exception(
+                    "Unhandled error closing connections after task id=%s",
+                    db_task.pk,
+                    extra=self._log_extra("worker_error", db_task),
+                )
 
     def run(self) -> None:
         """Poll for tasks until request_stop(), then drain in-flight tasks."""
@@ -3469,11 +4688,22 @@ class Worker:
         in_flight: set[Future[None]] = set()
         last_reap = 0.0
         last_dispatch = 0.0
-        # Set by a failed schedule dispatch and cleared only by one that
-        # succeeds, not per pass. Dispatch runs once per schedule_interval,
-        # at least a second by default, so under a shorter poll the passes
-        # after a failure do not dispatch at all, and --batch must not end
-        # on one of them while a due tick may never have been enqueued.
+        # Set when a dispatch pass starts and cleared only when one is
+        # traversed to its end, not per poll pass. Dispatch runs once per
+        # schedule_interval, at least a second by default, so under a
+        # shorter poll the passes after an abandoned one do not dispatch at
+        # all, and --batch must not end on one of them while a due tick may
+        # never have been looked at.
+        #
+        # A completed pass is not a pass in which every schedule enqueued.
+        # A schedule that failed on its own was attempted, reported and
+        # left for the next pass, and a schedule the database refuses on
+        # every attempt would otherwise hold a batch open until the job
+        # runner's timeout. So it clears this, and --batch can end with
+        # such a schedule still failing: the exit means the batch finished,
+        # and the failures are the ERROR events that say otherwise. Set
+        # before the pass rather than in a handler, so an exception of any
+        # class that escapes the pass leaves it owed.
         dispatch_owed = False
         executor = ThreadPoolExecutor(
             max_workers=self.concurrency, thread_name_prefix="ox"
@@ -3493,6 +4723,12 @@ class Worker:
         renewer.start()
         try:
             while not self._stop.is_set():
+                # First, before any statement, and on every pass including
+                # the ones whose statements fail: the file says the loop is
+                # turning, not that the database answered. A pass wedged in
+                # a statement that never returns never comes back here, and
+                # that is what makes the file go stale.
+                self._beat()
                 if self.parent_pid is not None and os.getppid() != self.parent_pid:
                     logger.warning(
                         "Worker %s lost its supervisor (pid %d); draining",
@@ -3516,32 +4752,27 @@ class Worker:
                     # returns immediately when it has nothing, which for the
                     # default settings source is one list check.
                     if time.monotonic() - last_dispatch >= self.schedule_interval:
+                        dispatch_owed = True
                         try:
                             self.dispatch_schedules()
-                        except DatabaseError:
-                            # Any statement in the pass can raise this: the
-                            # bounded tick read, a row lock, the tick INSERT,
-                            # the enqueue. The cause is the database rather
-                            # than a schedule, so the loop lets it out
-                            # instead of logging it against whichever
-                            # schedule was in hand. A pass lost this way is
+                        except DatabaseError as exc:
+                            # The pass was abandoned: a shared read failed,
+                            # or a schedule's failure left the connection
+                            # unusable (dispatch_schedules says which is
+                            # which). The cause is the database rather than
+                            # a schedule. A pass lost this way is
                             # recoverable at the next one, and the claim
                             # below still runs this pass. A connection that
                             # is no longer usable is dropped first, so the
                             # claim reconnects rather than failing on it too
-                            # and costing the whole poll pass.
-                            logger.warning(
-                                "Schedule dispatch failed; retrying next pass",
-                                exc_info=True,
-                                extra={
-                                    "event": "schedule_dispatch_failed",
-                                    "worker_id": self.worker_id,
-                                },
-                            )
+                            # and costing the whole poll pass. Reported in
+                            # full at the start of an outage and in summary
+                            # while it lasts.
+                            self._dispatch_report.pass_failed(exc)
                             close_old_connections()
-                            dispatch_owed = True
                         else:
                             dispatch_owed = False
+                            self._dispatch_report.pass_completed()
                         last_dispatch = time.monotonic()
                     in_flight = {f for f in in_flight if not f.done()}
                     # Read before claiming, not after: a task still running
@@ -3556,6 +4787,14 @@ class Worker:
                         and not self._stop.is_set()
                         and not self._limit_reached()
                     ):
+                        # Before each claim as well as at the head of the
+                        # pass: with a backlog one pass makes up to
+                        # --concurrency claims, each a round trip or more,
+                        # and on a database that answers slowly that pass
+                        # would otherwise age the file by all of them while
+                        # the loop is plainly advancing. A claim that never
+                        # returns still stops the updates.
+                        self._beat()
                         self._claim_contended = False
                         db_task = self.claim_one()
                         if db_task is None:
@@ -3601,6 +4840,21 @@ class Worker:
                     # and it is what the attempt path already does. close_all
                     # would also tear down a connection the caller owns.
                     close_old_connections()
+                    # With Django's pool, a restart leaves every connection it
+                    # holds idle as dead as the one this pass failed on, and
+                    # without CONN_HEALTH_CHECKS it hands them out unchecked:
+                    # one to each pass, so the loop claimed and dispatched
+                    # nothing for a poll interval per dead connection. With
+                    # them, a checkout tests each in turn, waiting longer
+                    # after each, and could time out before it found a live
+                    # one. One sweep on the failed pass discards them all,
+                    # though the next pass can still fail: the database may
+                    # still be down, or a connection drop after the sweep.
+                    # It replays nothing: reap, dispatch and claim wait for
+                    # the next pass as before. A claim that raised may still
+                    # have committed, and its row waits out its lease as it
+                    # always did.
+                    _sweep_pool(connections[self._db_alias])
                     self._stop.wait(self.poll_interval)
                     continue
                 if self._limit_reached():
@@ -3704,6 +4958,10 @@ class Worker:
         """
         give_up_at: float | None = None
         while True:
+            # A drain can outlast any age a probe allows, and a worker that
+            # is draining is doing what it was asked to, so each wait here
+            # counts as a pass of the loop.
+            self._beat()
             pending = {future for future in in_flight if not future.done()}
             if not pending:
                 return

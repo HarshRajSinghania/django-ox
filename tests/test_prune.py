@@ -18,6 +18,7 @@ from django.db import (
     transaction,
 )
 from django.db.models.signals import pre_delete
+from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
 
 from django_ox import _waiting, actions
@@ -66,6 +67,7 @@ class TestParseDuration:
             ("90m", timedelta(minutes=90)),
             ("45s", timedelta(seconds=45)),
             ("3600", timedelta(seconds=3600)),
+            ("0", timedelta(0)),
             (" 7d ", timedelta(days=7)),
         ],
     )
@@ -77,9 +79,37 @@ class TestParseDuration:
         with pytest.raises(CommandError):
             parse_duration(value)
 
+    @pytest.mark.parametrize(
+        "value", ["1000000000d", "99999999999999d", "9" * 5000 + "d"]
+    )
+    def test_rejects_out_of_range(self, value):
+        with pytest.raises(CommandError) as info:
+            parse_duration(value)
+        assert str(info.value) == f"Invalid duration {value!r}; it is out of range."
+
+    def test_a_duration_that_only_overflows_at_the_cutoff_still_parses(self):
+        # ox_prune's own guard catches this one; see TestOutOfRangeDuration.
+        assert parse_duration("3000000d") == timedelta(days=3_000_000)
+
 
 @pytest.mark.django_db
 class TestPrune:
+    def test_an_unreadable_duration_keeps_the_forms_message(self):
+        make_task(OxTask.Status.SUCCESSFUL, finished_days_ago=8)
+
+        with pytest.raises(CommandError, match="use forms like 7d"):
+            prune("--older-than=soon")
+
+        assert OxTask.objects.count() == 1
+
+    def test_zero_prunes_a_row_finished_just_now(self):
+        # The default 7d would keep this row.
+        just_finished = make_task(OxTask.Status.SUCCESSFUL, finished_days_ago=0)
+
+        prune("--older-than=0")
+
+        assert not OxTask.objects.filter(pk=just_finished.pk).exists()
+
     def test_prunes_old_successful_only_by_default(self):
         old_ok = make_task(OxTask.Status.SUCCESSFUL, finished_days_ago=8)
         old_failed = make_task(OxTask.Status.FAILED, finished_days_ago=8)
@@ -1313,3 +1343,52 @@ class TestPruneJsonFormat:
         assert "Stopped after deleting 2 " in captured.err
         assert pauses == [1, 2]
         assert OxTask.objects.count() == 3
+
+
+OUT_OF_RANGE = ["3000000d", "1000000000d", "99999999999999d", "9" * 5000 + "d"]
+
+
+@pytest.mark.django_db(transaction=True)
+class TestOutOfRangeDuration:
+    """#82: a retention too large to convert or to subtract is an argument error."""
+
+    @pytest.mark.parametrize("dry_run", [False, True])
+    @pytest.mark.parametrize("value", OUT_OF_RANGE)
+    def test_is_a_command_error_and_deletes_nothing(self, value, dry_run):
+        make_old_rows(3, OxTask.Status.SUCCESSFUL)
+        args = [f"--older-than={value}", *(["--dry-run"] if dry_run else [])]
+
+        with (
+            CaptureQueriesContext(connection) as queries,
+            pytest.raises(CommandError) as info,
+        ):
+            prune(*args)
+
+        assert queries.captured_queries == []
+        assert str(info.value) == f"Invalid duration {value!r}; it is out of range."
+        assert OxTask.objects.count() == 3
+
+    def test_exits_1_without_a_traceback_from_the_command_line(self, capsys):
+        make_old_rows(3, OxTask.Status.SUCCESSFUL)
+        argv = ["manage.py", "ox_prune", "--older-than=3000000d", "--skip-checks"]
+
+        with pytest.raises(SystemExit) as info:
+            ManagementUtility(argv).execute()
+
+        assert info.value.code == 1
+        err = capsys.readouterr().err
+        assert "Invalid duration '3000000d'; it is out of range." in err
+        assert "Traceback" not in err
+        assert OxTask.objects.count() == 3
+
+    def test_traceback_flag_still_raises(self):
+        argv = [
+            "manage.py",
+            "ox_prune",
+            "--older-than=3000000d",
+            "--skip-checks",
+            "--traceback",
+        ]
+        with pytest.raises(CommandError) as info:
+            ManagementUtility(argv).execute()
+        assert str(info.value) == "Invalid duration '3000000d'; it is out of range."
