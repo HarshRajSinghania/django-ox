@@ -3,7 +3,6 @@ import re
 import threading
 import time
 import uuid
-from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from io import StringIO
 
@@ -27,6 +26,7 @@ from django_ox.durations import parse_duration
 from django_ox.models import OxScheduleTick, OxTask
 
 from .contention import CONTENTION, failing, in_key_order, simulated
+from .test_import_beat import connection_time_zone
 from .test_waiting import waiting_for_a_lock
 
 
@@ -1413,27 +1413,6 @@ def _seconds_before(now, cutoff):
     return str(int((now - cutoff).total_seconds()))
 
 
-@contextmanager
-def connection_time_zone(alias, name):
-    """Point one connection at another zone, as DATABASES TIME_ZONE would."""
-    wrapper = connections[alias]
-    original = wrapper.settings_dict["TIME_ZONE"]
-
-    def reset():
-        for attr in ("timezone", "timezone_name"):
-            getattr(wrapper, attr)
-            delattr(wrapper, attr)
-        wrapper.ensure_timezone()
-
-    wrapper.settings_dict["TIME_ZONE"] = name
-    reset()
-    try:
-        yield
-    finally:
-        wrapper.settings_dict["TIME_ZONE"] = original
-        reset()
-
-
 @pytest.mark.django_db(transaction=True)
 class TestFirstDayCutoff:
     """#104: cutoffs on the first day of year one are rejected before bind."""
@@ -1447,9 +1426,14 @@ class TestFirstDayCutoff:
         make_old_rows(3, OxTask.Status.SUCCESSFUL)
 
         with connection_time_zone("default", "America/New_York"):
+            assert str(connections["default"].timezone) == "America/New_York"
             for extra in ([], ["--dry-run"]):
-                with pytest.raises(CommandError) as info:
+                with (
+                    CaptureQueriesContext(connection) as queries,
+                    pytest.raises(CommandError) as info,
+                ):
                     prune(f"--older-than={value}", *extra)
+                assert queries.captured_queries == []
                 assert str(info.value) == (
                     f"Invalid duration {value!r}; it is out of range."
                 )
@@ -1479,6 +1463,27 @@ class TestFirstDayCutoff:
 
         assert OxTask.objects.count() == 3
 
+    @pytest.mark.skipif(not settings.USE_TZ, reason="Requires timezone-aware datetimes")
+    @pytest.mark.parametrize("dry_run", [False, True])
+    def test_cutoff_exactly_at_the_floor_succeeds_in_new_york(
+        self, monkeypatch, dry_run
+    ):
+        now = _cutoff_now()
+        monkeypatch.setattr(timezone, "now", lambda: now)
+        floor = datetime.min.replace(tzinfo=UTC) + timedelta(days=1)
+        value = _seconds_before(now, floor)
+        make_old_rows(3, OxTask.Status.SUCCESSFUL)
+        make_tick("nightly", scheduled_days_ago=2)
+        make_tick("nightly", scheduled_days_ago=1)
+
+        with connection_time_zone("default", "America/New_York"):
+            assert str(connections["default"].timezone) == "America/New_York"
+            out = prune(f"--older-than={value}", *(["--dry-run"] if dry_run else []))
+
+        assert f"before {floor.isoformat()}." in out
+        assert OxTask.objects.count() == 3
+        assert OxScheduleTick.objects.count() == 2
+
     def test_ordinary_seven_day_retention_is_unchanged(self):
         old_ok = make_task(OxTask.Status.SUCCESSFUL, finished_days_ago=8)
         young_ok = make_task(OxTask.Status.SUCCESSFUL, finished_days_ago=1)
@@ -1502,9 +1507,12 @@ class TestFirstDayCutoff:
             "--skip-checks",
         ]
 
-        with connection_time_zone("default", "America/New_York"):
-            with pytest.raises(SystemExit) as info:
-                ManagementUtility(argv).execute()
+        with (
+            connection_time_zone("default", "America/New_York"),
+            pytest.raises(SystemExit) as info,
+        ):
+            assert str(connections["default"].timezone) == "America/New_York"
+            ManagementUtility(argv).execute()
 
         assert info.value.code == 1
         err = capsys.readouterr().err

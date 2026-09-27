@@ -13,10 +13,9 @@ from django_ox.durations import parse_duration
 from django_ox.management._database import DatabaseCommand
 from django_ox.models import OxScheduleTick, OxTask
 
-# SQLite and MySQL overflow when binding cutoffs on the first day of year
-# one after converting into a connection zone west of UTC. Reject that
-# whole first day on every engine so the command fails as an argument
-# error instead of a driver traceback.
+# Reserve a full day so conversion to any connection timezone cannot
+# underflow datetime.min. Apply the same floor on every engine so the
+# answer does not depend on the engine or connection timezone.
 _CUTOFF_FLOOR = datetime.min + timedelta(days=1)
 
 
@@ -93,9 +92,7 @@ class Command(DatabaseCommand):
         if timezone.is_aware(cutoff):
             floor = timezone.make_aware(_CUTOFF_FLOOR, UTC)
         if cutoff < floor:
-            raise CommandError(
-                f"Invalid duration {older_than!r}; it is out of range."
-            )
+            raise CommandError(f"Invalid duration {older_than!r}; it is out of range.")
         # DISCARDED prunes with SUCCESSFUL: the row is already closed, so
         # there is nothing left on it to wait for. WAITING is in neither
         # list, because that task has not run.
